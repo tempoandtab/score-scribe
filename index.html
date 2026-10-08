@@ -263,8 +263,11 @@ Output format, exactly:
 2. After the fence, a short list headed "Uncertain:" — one line per doubtful spot, e.g. "Violin I, m.7 beat 3: could be F# or G eighth note". If nothing was doubtful, write "Uncertain: none".
 No other commentary.`;
 
-function correctionPrompt(userText, currentXml) {
-  return `You previously transcribed the attached photograph of a handwritten full score into MusicXML. The user — a music teacher comparing your transcription against the photo — reports these errors:
+function correctionPrompt(userText, currentXml, hasImage) {
+  const source = hasImage
+    ? "You previously transcribed the attached photograph of a handwritten full score into MusicXML."
+    : "You previously produced the MusicXML transcription below (no photo is attached this time).";
+  return `${source} The user — a music teacher comparing your transcription against the photo — reports these errors:
 
 ${userText}
 
@@ -607,8 +610,8 @@ $("transcribe-btn").addEventListener("click", async () => {
 $("apply-correction").addEventListener("click", async () => {
   const text = $("correction-input").value.trim();
   if (!text) { toast("Describe the mistake first."); return; }
-  if (state.isDemo) {
-    toast("Demo mode: connect your free Gemini API key to correct real transcriptions.");
+  if (!getKey()) {
+    toast("Add your free Gemini API key under Settings to use corrections.");
     return;
   }
   const btn = $("apply-correction");
@@ -616,7 +619,9 @@ $("apply-correction").addEventListener("click", async () => {
   const oldLabel = btn.textContent;
   btn.textContent = "Applying…";
   try {
-    const raw = await callGemini(correctionPrompt(text, state.musicXml), true);
+    // In demo mode there is no photo, so the correction is applied to the
+    // MusicXML alone; with a real transcription the photo is re-sent too.
+    const raw = await callGemini(correctionPrompt(text, state.musicXml, !state.isDemo), !state.isDemo);
     const { xml, notes } = parseTranscription(raw);
     state.musicXml = xml;
     state.notes = notes;
