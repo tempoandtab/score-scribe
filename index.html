@@ -1,0 +1,973 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>ScoreScribe — Handwritten Score to Digital Notation</title>
+<!--
+  ScoreScribe v1 — a single-file web app.
+  Pipeline: photo → (browser resize) → Gemini vision API → MusicXML
+            → Verovio (WASM engraving) → side-by-side review
+            → plain-language corrections → export (MusicXML / MIDI / SVG / PDF).
+
+  To run: open this file in any modern browser (internet needed for the
+  Verovio CDN + the Gemini API). Or host the file on GitHub Pages / Netlify.
+
+  To vibe-code on it later: each section below is commented. The recognition
+  layer is just `callGemini()` — swap the model or provider there and nothing
+  downstream changes (image in → MusicXML out).
+-->
+<style>
+  :root{
+    --bg:#f7f4ee; --card:#ffffff; --ink:#232323; --muted:#6b6b6b;
+    --accent:#1d6fd1; --accent-dark:#155bb0; --warn:#b7791f; --warn-bg:#fdf3e0;
+    --danger:#c0392b; --radius:14px;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.45; -webkit-text-size-adjust:100%;
+  }
+  header{padding:20px 16px 8px; text-align:center}
+  header h1{margin:0; font-size:1.7rem}
+  .tagline{margin:4px 0 12px; color:var(--muted)}
+  .steps{list-style:none; display:flex; gap:6px; justify-content:center; padding:0; margin:0 0 8px; flex-wrap:wrap}
+  .steps li{
+    font-size:.8rem; padding:6px 12px; border-radius:999px;
+    background:#e9e4d8; color:var(--muted);
+  }
+  .steps li.active{background:var(--accent); color:#fff; font-weight:600}
+  .steps li.done{background:#d7e9d4; color:#2d6a2d}
+  main{max-width:1020px; margin:0 auto; padding:8px 16px 60px}
+  .card{
+    background:var(--card); border-radius:var(--radius); padding:20px;
+    margin:14px 0; box-shadow:0 2px 10px rgba(0,0,0,.06);
+  }
+  .card h2,.card h3{margin-top:0}
+  .hint{color:var(--muted); font-size:.92rem}
+  .tiny{color:var(--muted); font-size:.8rem}
+  .btn{
+    display:inline-block; border:1px solid #cfc9ba; background:#fff; color:var(--ink);
+    border-radius:10px; padding:12px 18px; font-size:1rem; cursor:pointer;
+    min-height:48px; text-align:center; text-decoration:none;
+  }
+  .btn:active{transform:scale(.98)}
+  .btn.primary{background:var(--accent); border-color:var(--accent-dark); color:#fff; font-weight:600}
+  .btn.primary:disabled{background:#a9c4e6; border-color:#a9c4e6; cursor:not-allowed}
+  .btn.big{display:block; width:100%; font-size:1.1rem; margin:10px 0}
+  .btn.danger-ghost{border-color:#e3b7b0; color:var(--danger); background:#fff}
+  .row{display:flex; gap:10px; margin-top:12px; flex-wrap:wrap}
+  .row.wrap .btn{flex:1 1 140px}
+  .divider{display:flex; align-items:center; gap:10px; color:var(--muted); margin:14px 0}
+  .divider::before,.divider::after{content:""; flex:1; height:1px; background:#ddd6c6}
+  #preview-wrap{margin-top:14px}
+  #preview{max-width:100%; border-radius:8px; border:1px solid #ddd; max-height:60vh}
+  details#settings{margin:14px 0; border:1px solid #e2dccb; border-radius:10px; padding:10px 14px; background:#fbf9f4}
+  details#settings summary{cursor:pointer; font-weight:600; padding:6px 0}
+  details#settings label{display:block; margin:10px 0; font-size:.92rem}
+  details#settings input{width:100%; margin-top:4px; padding:10px; font-size:1rem; border:1px solid #cfc9ba; border-radius:8px}
+  /* Review panels */
+  .panels{display:grid; grid-template-columns:1fr 1fr; gap:14px}
+  @media (max-width:760px){ .panels{grid-template-columns:1fr} }
+  .panel{background:var(--card); border-radius:var(--radius); padding:16px; box-shadow:0 2px 10px rgba(0,0,0,.06)}
+  .panel h3{margin:0 0 10px}
+  #original-img{max-width:100%; border-radius:8px; border:1px solid #ddd}
+  #score-pages svg{width:100%; height:auto; background:#fff; border:1px solid #eee; border-radius:8px; margin-bottom:10px}
+  #uncertainty-card{border-left:5px solid var(--warn); background:var(--warn-bg)}
+  #uncertainty-list{margin:6px 0; padding-left:20px}
+  #correction-input{width:100%; font-size:1rem; padding:10px; border:1px solid #cfc9ba; border-radius:8px; font-family:inherit}
+  #correction-history{list-style:none; padding:0}
+  #correction-history li{background:#eef4ff; border-radius:8px; padding:8px 10px; margin:6px 0}
+  /* Progress */
+  #progress{text-align:center; padding:40px 20px}
+  .spinner{
+    width:44px; height:44px; margin:0 auto 14px; border-radius:50%;
+    border:5px solid #dfe7f3; border-top-color:var(--accent);
+    animation:spin 1s linear infinite;
+  }
+  @keyframes spin{to{transform:rotate(360deg)}}
+  /* Toast */
+  #toast{
+    position:fixed; left:50%; bottom:24px; transform:translateX(-50%);
+    background:#232323; color:#fff; padding:12px 20px; border-radius:10px;
+    max-width:90vw; z-index:50; box-shadow:0 4px 16px rgba(0,0,0,.25);
+  }
+  /* Print: only the engraved score */
+  #print-area{display:none}
+  @media print{
+    body.printing > header, body.printing > main, body.printing > footer, body.printing > #toast{display:none !important}
+    #print-area{display:block !important}
+    #print-area svg{width:100%; height:auto; page-break-inside:avoid}
+  }
+  footer{text-align:center; color:var(--muted); font-size:.8rem; padding:20px}
+  footer a{color:var(--accent)}
+</style>
+<!-- The Verovio notation engine is loaded dynamically by loadVerovio() in the
+     script below, with a fallback CDN, a visible load status, and a retry.
+     (A plain <script src> tag can't report failures, which left users stuck
+     staring at a spinner when the CDN was unreachable.) -->
+</head>
+<body>
+
+<header>
+  <h1>🎻 ScoreScribe</h1>
+  <p class="tagline">Photograph a handwritten score → get clean, engraved notation.</p>
+  <ol class="steps">
+    <li id="pill-1" class="active">1 · Photo</li>
+    <li id="pill-2">2 · Transcribe</li>
+    <li id="pill-3">3 · Review &amp; fix</li>
+    <li id="pill-4">4 · Export</li>
+  </ol>
+</header>
+
+<main>
+  <!-- ============ STEP 1: PHOTO ============ -->
+  <section id="view-upload">
+    <div class="card">
+      <h2>Photograph the handwritten score</h2>
+      <p class="hint">One page per photo. Lay the page flat, fill the frame, and avoid shadows. Works with full scores (multiple staves) — one staff becomes one part.</p>
+
+      <label class="btn primary big" for="file-input">📷 Take photo / Upload image</label>
+      <input type="file" id="file-input" accept="image/*" capture="environment" hidden>
+
+      <div id="preview-wrap" hidden>
+        <img id="preview" alt="Score photo preview">
+        <div class="row">
+          <button id="rotate-left" class="btn" type="button">⟲ Rotate left</button>
+          <button id="rotate-right" class="btn" type="button">⟳ Rotate right</button>
+          <button id="remove-photo" class="btn danger-ghost" type="button">Remove</button>
+        </div>
+      </div>
+
+      <details id="settings">
+        <summary>⚙️ Settings — free transcription key</summary>
+        <p class="hint">Transcription uses Google's Gemini API <strong>free tier</strong> (no credit card).
+          <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Get a free key at Google AI Studio</a>
+          and paste it below. The key is stored only in this browser.</p>
+        <label>API key
+          <input type="password" id="api-key" placeholder="AIza…" autocomplete="off">
+        </label>
+        <label>Model name
+          <input type="text" id="model-name" value="gemini-2.5-flash">
+        </label>
+        <p class="tiny">If transcription ever fails with a "model not found" error, check AI Studio for the current model name and update this field.</p>
+      </details>
+
+      <button id="transcribe-btn" class="btn primary big" type="button" disabled>Transcribe →</button>
+
+      <div class="divider"><span>or</span></div>
+      <button id="demo-btn" class="btn big" type="button">Try the demo <span class="tiny">(no key needed)</span></button>
+      <p class="tiny" style="text-align:center">Demo loads a sample string-orchestra excerpt so you can explore the review &amp; export tools.</p>
+      <p id="engine-status" class="tiny" style="text-align:center">⏳ Loading notation engine…</p>
+    </div>
+  </section>
+
+  <!-- ============ STEPS 2–4: WORKING / REVIEW ============ -->
+  <section id="view-working" hidden>
+    <div id="progress" class="card" hidden>
+      <div class="spinner"></div>
+      <p id="progress-text">Reading your handwriting…</p>
+      <p class="tiny">This usually takes 15–60 seconds for a full score page.</p>
+    </div>
+
+    <div id="review" hidden>
+      <div class="panels">
+        <div class="panel">
+          <h3>🖼️ Original photo</h3>
+          <img id="original-img" alt="Original handwritten score">
+          <p class="tiny" id="demo-photo-note" hidden>Demo mode — your photo would appear here.</p>
+        </div>
+        <div class="panel">
+          <h3>🎼 Engraved score</h3>
+          <div id="score-pages"></div>
+        </div>
+      </div>
+
+      <div class="card" id="uncertainty-card" hidden>
+        <h3>⚠️ Double-check these</h3>
+        <p class="hint">The transcription was unsure about the spots below. Use the correction box to fix any that are wrong.</p>
+        <ul id="uncertainty-list"></ul>
+      </div>
+
+      <div class="card">
+        <h3>✏️ Correct mistakes</h3>
+        <p class="hint">Describe what's wrong in plain words — e.g. <em>"Viola, bar 3: the second note is a quarter-note E, not D."</em> Then press Apply. Nothing else in the score will change.</p>
+        <textarea id="correction-input" rows="3" placeholder="Bar 7, Violin I: …"></textarea>
+        <div class="row"><button id="apply-correction" class="btn primary" type="button">Apply correction</button></div>
+        <ul id="correction-history"></ul>
+      </div>
+
+      <div class="card">
+        <h3>📤 Export</h3>
+        <div class="row wrap">
+          <button id="export-xml" class="btn" type="button">MusicXML</button>
+          <button id="export-midi" class="btn" type="button">MIDI</button>
+          <button id="export-svg" class="btn" type="button">SVG</button>
+          <button id="export-pdf" class="btn" type="button">Print / PDF</button>
+        </div>
+        <p class="tiny">MusicXML opens in MuseScore, Dorico, Finale &amp; Sibelius. Print uses your browser's print dialog — choose "Save as PDF".</p>
+      </div>
+
+      <button id="start-over" class="btn danger-ghost" type="button">← Start over with a new photo</button>
+    </div>
+  </section>
+</main>
+
+<div id="print-area"></div>
+<div id="toast" hidden></div>
+
+<footer>
+  ScoreScribe v1 · Recognition by Gemini (free tier) · Engraving by
+  <a href="https://www.verovio.org" target="_blank" rel="noopener">Verovio</a> ·
+  your photos never leave your browser except to the transcription API.
+</footer>
+
+<script>
+"use strict";
+/* =====================================================================
+   ScoreScribe v1 — application logic
+   Sections:
+     1. Config & prompts      — the "recognition layer" (swap me!)
+     2. State & tiny helpers
+     3. Photo handling        — upload, downscale, rotate
+     4. Settings              — API key storage
+     5. Transcription API     — Gemini vision → MusicXML
+     6. Engraving             — Verovio render
+     7. Flows                 — transcribe / correct / demo / exports
+     8. Demo data             — sample string-orchestra MusicXML
+   ===================================================================== */
+
+/* ---------------- 1. Config & prompts ---------------- */
+// This is the entire "recognition layer": image in, MusicXML out.
+// To swap providers later, rewrite callGemini() and keep its contract:
+//   callGemini(promptText, { includeImage:boolean }) -> Promise<string>
+// Everything downstream only ever sees MusicXML text.
+const DEFAULT_MODEL = "gemini-2.5-flash";
+const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models";
+
+const TRANSCRIBE_PROMPT = `You are a precise music transcription engine. The attached image is a photograph of a HANDWRITTEN full musical score: multiple staves, one staff per instrument (for example a string orchestra score with Violin I, Violin II, Viola, Cello, Double Bass — but the actual instrumentation may differ; read any handwritten instrument labels).
+
+Transcribe the ENTIRE page into MusicXML 4.0 as a <score-partwise> document. Rules:
+- One <part> per staff/instrument, in top-to-bottom score order. Name each part from the handwritten label when present, otherwise Part 1, Part 2, and so on.
+- If the page holds several systems (the music continues on a second system below), transcribe them in reading order with continuing measure numbers.
+- Include clefs, key signatures and time signatures exactly as written, including any mid-piece changes.
+- Transcribe every note and rest with correct pitch, octave and duration. Only use multiple voices or <backup>/<forward> when the handwriting clearly shows more than one voice on a single staff.
+- Encode repeats, first/second endings, dynamics (p, f, hairpins), articulations (staccato, accents, etc.), slurs, ties, tempo markings and rehearsal marks as proper MusicXML directions/articulations/notations.
+- Encode any other handwritten text (fingerings, bowings, instructions like "watch 3rd finger" or "again") as <words> directions attached to the correct measure.
+- If something is ambiguous, make your best musical guess — do NOT skip measures. Every visible measure must appear in the output.
+- Do NOT invent music that is not in the image.
+
+Output format, exactly:
+1. First, ONE \`\`\`xml code fence containing the COMPLETE MusicXML document and nothing else.
+2. After the fence, a short list headed "Uncertain:" — one line per doubtful spot, e.g. "Violin I, m.7 beat 3: could be F# or G eighth note". If nothing was doubtful, write "Uncertain: none".
+No other commentary.`;
+
+function correctionPrompt(userText, currentXml) {
+  return `You previously transcribed the attached photograph of a handwritten full score into MusicXML. The user — a music teacher comparing your transcription against the photo — reports these errors:
+
+${userText}
+
+Here is your current transcription:
+\`\`\`xml
+${currentXml}
+\`\`\`
+
+Return the FULL corrected MusicXML document in ONE \`\`\`xml code fence (output the entire document, not a diff), changing only what the user flagged and preserving everything else exactly. After the fence, list any remaining uncertainties under the heading "Uncertain:". No other commentary.`;
+}
+
+/* ---------------- 2. State & tiny helpers ---------------- */
+const state = {
+  imageDataUrl: null,   // resized photo as data URL (for display)
+  imageB64: null,       // same photo, raw base64 (for the API)
+  isDemo: false,
+  musicXml: null,
+  notes: [],            // "Uncertain:" lines from the model
+  corrections: [],      // user correction strings, for the history list
+};
+let vrv = null;         // Verovio toolkit instance
+let vrvReady = false;
+
+const $ = (id) => document.getElementById(id);
+
+function toast(msg, ms = 4500) {
+  const el = $("toast");
+  el.textContent = msg;
+  el.hidden = false;
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.hidden = true; }, ms);
+}
+
+function setStep(n) {
+  for (let i = 1; i <= 4; i++) {
+    const pill = $("pill-" + i);
+    pill.classList.toggle("active", i === n);
+    pill.classList.toggle("done", i < n);
+  }
+}
+
+function download(filename, blob) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 4000);
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+/* ---------------- 3. Photo handling ---------------- */
+const MAX_SIDE = 1600; // downscale so uploads stay fast & API images stay cheap
+
+$("file-input").addEventListener("change", (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (file) loadImageFile(file);
+  e.target.value = ""; // allow re-picking the same file
+});
+
+async function loadImageFile(file) {
+  try {
+    // createImageBitmap honours EXIF orientation so phone photos aren't sideways
+    let bmp;
+    try {
+      bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
+    } catch (_) {
+      bmp = await new Promise((res, rej) => {
+        const img = new Image();
+        img.onload = () => res(img);
+        img.onerror = rej;
+        img.src = URL.createObjectURL(file);
+      });
+    }
+    const scale = Math.min(1, MAX_SIDE / Math.max(bmp.width, bmp.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(bmp.width * scale);
+    canvas.height = Math.round(bmp.height * scale);
+    canvas.getContext("2d").drawImage(bmp, 0, 0, canvas.width, canvas.height);
+    if (bmp.close) bmp.close();
+    setPhoto(canvas.toDataURL("image/jpeg", 0.88));
+  } catch (err) {
+    toast("Couldn't read that image. Try a different photo.");
+  }
+}
+
+function setPhoto(dataUrl) {
+  state.imageDataUrl = dataUrl;
+  state.imageB64 = dataUrl.split(",")[1];
+  state.isDemo = false;
+  $("preview").src = dataUrl;
+  $("preview-wrap").hidden = false;
+  updateActionButtons();
+}
+
+function rotatePhoto(dir) {
+  // dir: +1 = clockwise, -1 = counter-clockwise
+  if (!state.imageDataUrl) return;
+  const img = new Image();
+  img.onload = () => {
+    const canvas = document.createElement("canvas");
+    canvas.width = img.height;
+    canvas.height = img.width;
+    const ctx = canvas.getContext("2d");
+    ctx.translate(canvas.width / 2, canvas.height / 2);
+    ctx.rotate(dir * Math.PI / 2);
+    ctx.drawImage(img, -img.width / 2, -img.height / 2);
+    setPhoto(canvas.toDataURL("image/jpeg", 0.88));
+  };
+  img.src = state.imageDataUrl;
+}
+$("rotate-left").addEventListener("click", () => rotatePhoto(-1));
+$("rotate-right").addEventListener("click", () => rotatePhoto(1));
+$("remove-photo").addEventListener("click", () => {
+  state.imageDataUrl = state.imageB64 = null;
+  $("preview-wrap").hidden = true;
+  updateActionButtons();
+});
+
+/* ---------------- 4. Settings (API key) ---------------- */
+function getKey()   { return $("api-key").value.trim(); }
+function getModel() { return ($("model-name").value.trim() || DEFAULT_MODEL); }
+
+function saveSetting(k, v) { try { localStorage.setItem(k, v); } catch (_) { /* ignore */ } }
+$("api-key").addEventListener("input", () => saveSetting("ss_key", $("api-key").value));
+$("model-name").addEventListener("input", () => saveSetting("ss_model", $("model-name").value));
+
+/* ---------------- 5. Transcription API ---------------- */
+// Contract: prompt text (+ optional photo) in, raw model text out.
+async function callGemini(promptText, includeImage) {
+  const key = getKey();
+  if (!key) throw new Error("Add your free Gemini API key under Settings first (or try the demo).");
+  const url = `${GEMINI_ENDPOINT}/${encodeURIComponent(getModel())}:generateContent?key=${encodeURIComponent(key)}`;
+  const parts = [{ text: promptText }];
+  if (includeImage) {
+    if (!state.imageB64) throw new Error("No photo loaded.");
+    parts.push({ inline_data: { mime_type: "image/jpeg", data: state.imageB64 } });
+  }
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts }],
+      generationConfig: { temperature: 0.15, maxOutputTokens: 32768 },
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = (data.error && data.error.message) || `Request failed (HTTP ${res.status})`;
+    throw new Error(msg);
+  }
+  const text = (data.candidates?.[0]?.content?.parts || [])
+    .map((p) => p.text || "").join("");
+  if (!text) throw new Error("The model returned an empty response. Try again.");
+  return text;
+}
+
+// Pull the ```xml fence out of the model's reply; the rest is the
+// "Uncertain:" notes list. Throws if nothing looks like MusicXML.
+function parseTranscription(raw) {
+  let xml = null;
+  const fence = raw.match(/```xml\s*([\s\S]*?)```/i);
+  if (fence) {
+    xml = fence[1].trim();
+  } else {
+    const idx = raw.indexOf("<score-partwise");
+    if (idx >= 0) xml = raw.slice(idx).trim();
+  }
+  if (!xml || !xml.includes("<score-partwise")) {
+    throw new Error("The model didn't return valid MusicXML. Raw reply logged to console — try again or rephrase.");
+  }
+  // Everything outside the fence is treated as uncertainty notes.
+  const notesText = raw.replace(/```xml\s*[\s\S]*?```/i, "").trim();
+  const notes = notesText.split("\n")
+    .map((l) => l.replace(/^[-*•\d.)\s]+/, "").trim())
+    .filter((l) => l && !/^uncertain:?\s*none\.?$/i.test(l) && !/^uncertain:?$/i.test(l));
+  return { xml, notes };
+}
+
+/* ---------------- 6. Engraving (Verovio) ---------------- */
+// Two CDNs for the engine: the official build, then the npm package via
+// jsDelivr as a fallback. Loading is dynamic so failures are visible and
+// retryable instead of a silent dead spinner.
+const VEROVIO_URLS = [
+  "https://www.verovio.org/javascript/latest/verovio-toolkit-wasm.js",
+  "https://cdn.jsdelivr.net/npm/verovio@6/dist/verovio-toolkit-wasm.js",
+];
+
+function updateActionButtons() {
+  $("transcribe-btn").disabled = !(state.imageB64 && vrvReady);
+  $("demo-btn").disabled = !vrvReady;
+}
+
+function setEngineStatus(status, detail) {
+  const el = $("engine-status");
+  if (status === "ready") {
+    el.textContent = "✓ Notation engine ready";
+  } else if (status === "failed") {
+    el.innerHTML = "";
+    const warn = document.createElement("span");
+    warn.textContent = "⚠️ Couldn't load the notation engine (" + (detail || "network error") + "). " +
+      "Check your connection — and if you opened this file inside another app's preview, open it in Safari or Chrome instead. ";
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "btn";
+    retry.style.cssText = "min-height:0;padding:8px 14px;margin-top:6px";
+    retry.textContent = "Try again";
+    retry.addEventListener("click", () => loadVerovio(0));
+    el.append(warn, retry);
+  } else {
+    el.textContent = "⏳ Loading notation engine… (first visit can take ~30 seconds)";
+  }
+  updateActionButtons();
+}
+
+function loadVerovio(attempt) {
+  attempt = attempt || 0;
+  setEngineStatus("loading");
+  const script = document.createElement("script");
+  let settled = false;
+  const fail = (reason) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    script.remove();
+    if (attempt + 1 < VEROVIO_URLS.length) {
+      loadVerovio(attempt + 1); // try the fallback CDN
+    } else {
+      console.error("Verovio failed to load:", reason);
+      setEngineStatus("failed", reason);
+    }
+  };
+  const timer = setTimeout(() => fail("download timed out"), 60000);
+  // If the engine starts but never signals readiness, treat as failure.
+  const readyWatchdog = setTimeout(() => fail("engine started but never became ready"), 90000);
+  script.onload = () => {
+    if (window.verovio && verovio.module) {
+      verovio.module.onRuntimeInitialized = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        clearTimeout(readyWatchdog);
+        vrv = new verovio.toolkit();
+        vrvReady = true;
+        setEngineStatus("ready");
+      };
+    } else {
+      clearTimeout(readyWatchdog);
+      fail("script loaded but the engine API was missing");
+    }
+  };
+  script.onerror = () => { clearTimeout(readyWatchdog); fail("download failed"); };
+  script.src = VEROVIO_URLS[attempt];
+  document.head.appendChild(script);
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  // Restore saved settings (guarded: some sandboxed viewers block storage)
+  try {
+    $("api-key").value = localStorage.getItem("ss_key") || "";
+    $("model-name").value = localStorage.getItem("ss_model") || DEFAULT_MODEL;
+  } catch (_) { /* ignore */ }
+  loadVerovio(0);
+});
+
+function renderScore() {
+  if (!vrvReady) throw new Error("Notation engine is still loading — wait a few seconds and try again.");
+  vrv.loadData(state.musicXml);
+  const pages = vrv.getPageCount();
+  const host = $("score-pages");
+  host.innerHTML = "";
+  for (let p = 1; p <= pages; p++) {
+    const div = document.createElement("div");
+    div.innerHTML = vrv.renderToSVG(p, {});
+    host.appendChild(div);
+  }
+  // Uncertainty notes
+  const card = $("uncertainty-card"), list = $("uncertainty-list");
+  list.innerHTML = "";
+  if (state.notes.length) {
+    state.notes.forEach((n) => {
+      const li = document.createElement("li");
+      li.textContent = n;
+      list.appendChild(li);
+    });
+    card.hidden = false;
+  } else {
+    card.hidden = true;
+  }
+}
+
+/* ---------------- 7. Flows ---------------- */
+function showWorking() {
+  $("view-upload").hidden = true;
+  $("view-working").hidden = false;
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+function showProgress(text) {
+  $("progress").hidden = false;
+  $("review").hidden = true;
+  $("progress-text").textContent = text;
+  setStep(2);
+}
+function showReview() {
+  $("progress").hidden = true;
+  $("review").hidden = false;
+  setStep(3);
+  $("pill-4").classList.add("done"); // export is part of the review screen
+}
+
+$("transcribe-btn").addEventListener("click", async () => {
+  if (!state.imageB64) { toast("Add a photo first."); return; }
+  if (!getKey()) { toast("Add your free Gemini API key under Settings first (or try the demo)."); return; }
+  showWorking();
+  showProgress("Reading your handwriting…");
+  try {
+    const raw = await callGemini(TRANSCRIBE_PROMPT, true);
+    const { xml, notes } = parseTranscription(raw);
+    state.musicXml = xml;
+    state.notes = notes;
+    state.isDemo = false;
+    state.corrections = [];
+    $("correction-history").innerHTML = "";
+    $("original-img").src = state.imageDataUrl;
+    $("demo-photo-note").hidden = true;
+    renderScore();
+    showReview();
+  } catch (err) {
+    console.error(err);
+    $("view-working").hidden = true;
+    $("view-upload").hidden = false;
+    setStep(1);
+    toast("Transcription failed: " + err.message, 7000);
+  }
+});
+
+$("apply-correction").addEventListener("click", async () => {
+  const text = $("correction-input").value.trim();
+  if (!text) { toast("Describe the mistake first."); return; }
+  if (state.isDemo) {
+    toast("Demo mode: connect your free Gemini API key to correct real transcriptions.");
+    return;
+  }
+  const btn = $("apply-correction");
+  btn.disabled = true;
+  const oldLabel = btn.textContent;
+  btn.textContent = "Applying…";
+  try {
+    const raw = await callGemini(correctionPrompt(text, state.musicXml), true);
+    const { xml, notes } = parseTranscription(raw);
+    state.musicXml = xml;
+    state.notes = notes;
+    state.corrections.push(text);
+    const li = document.createElement("li");
+    li.textContent = "✓ " + text;
+    $("correction-history").appendChild(li);
+    $("correction-input").value = "";
+    renderScore();
+    toast("Correction applied — score re-engraved.");
+  } catch (err) {
+    console.error(err);
+    toast("Correction failed: " + err.message, 7000);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldLabel;
+  }
+});
+
+$("demo-btn").addEventListener("click", () => {
+  showWorking();
+  showProgress("Loading demo score…");
+  setTimeout(() => {
+    state.isDemo = true;
+    state.musicXml = DEMO_XML;
+    state.notes = DEMO_NOTES.slice();
+    state.corrections = [];
+    $("correction-history").innerHTML = "";
+    $("original-img").removeAttribute("src");
+    $("demo-photo-note").hidden = false;
+    try {
+      renderScore();
+      showReview();
+      toast("Demo score loaded — try the correction box and the exports.");
+    } catch (err) {
+      console.error(err);
+      toast("Demo failed: " + err.message, 7000);
+    }
+  }, 900);
+});
+
+$("start-over").addEventListener("click", () => {
+  $("view-working").hidden = true;
+  $("view-upload").hidden = false;
+  $("progress").hidden = true;
+  $("review").hidden = true;
+  setStep(1);
+  window.scrollTo({ top: 0, behavior: "smooth" });
+});
+
+/* ---------------- Exports ---------------- */
+$("export-xml").addEventListener("click", () => {
+  if (!state.musicXml) return;
+  download("score.musicxml", new Blob([state.musicXml], { type: "application/xml" }));
+  setStep(4);
+});
+
+$("export-midi").addEventListener("click", () => {
+  try {
+    const b64 = vrv.renderToMIDI(); // base64-encoded MIDI file
+    const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    download("score.mid", new Blob([bytes], { type: "audio/midi" }));
+    setStep(4);
+  } catch (err) {
+    toast("MIDI export failed: " + err.message);
+  }
+});
+
+$("export-svg").addEventListener("click", () => {
+  try {
+    const pages = vrv.getPageCount();
+    for (let p = 1; p <= pages; p++) {
+      const svg = vrv.renderToSVG(p, {});
+      setTimeout(
+        ((pg, data) => () => download(`score-page-${pg}.svg`, new Blob([data], { type: "image/svg+xml" }))),
+        (p - 1) * 600, p, svg
+      );
+    }
+    setStep(4);
+  } catch (err) {
+    toast("SVG export failed: " + err.message);
+  }
+});
+
+$("export-pdf").addEventListener("click", () => {
+  $("print-area").innerHTML = $("score-pages").innerHTML;
+  document.body.classList.add("printing");
+  window.print();
+});
+window.addEventListener("afterprint", () => document.body.classList.remove("printing"));
+
+/* ---------------- 8. Demo data ---------------- */
+// A short original string-orchestra excerpt (D major, 4/4), encoded by hand
+// as MusicXML. Powers the "Try the demo" button so the review / correction /
+// export UI can be explored without an API key.
+const DEMO_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd">
+<score-partwise version="4.0">
+  <work><work-title>Demo Excerpt — String Orchestra</work-title></work>
+  <part-list>
+    <score-part id="P1"><part-name>Violin I</part-name></score-part>
+    <score-part id="P2"><part-name>Violin II</part-name></score-part>
+    <score-part id="P3"><part-name>Viola</part-name></score-part>
+    <score-part id="P4"><part-name>Cello</part-name></score-part>
+    <score-part id="P5"><part-name>Contrabass</part-name></score-part>
+  </part-list>
+
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>4</divisions><key><fifths>2</fifths></key><time><beats>4</beats><beat-type>4</beat-type></time><clef><sign>G</sign><line>2</line></clef></attributes>
+      <direction placement="below"><direction-type><dynamics><mp/></dynamics></direction-type></direction>
+      <note><pitch><step>D</step><octave>5</octave></pitch><duration>4</duration><type>quarter</type><notations><slur type="start" number="1" placement="above"/></notations></note>
+      <note><pitch><step>E</step><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>F</step><alter>1</alter><octave>5</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="2">
+      <note><pitch><step>G</step><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>F</step><alter>1</alter><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>E</step><octave>5</octave></pitch><duration>8</duration><type>half</type><notations><slur type="stop" number="1"/></notations></note>
+    </measure>
+    <measure number="3">
+      <direction placement="below"><direction-type><wedge type="crescendo"/></direction-type></direction>
+      <note><pitch><step>D</step><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>E</step><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>F</step><alter>1</alter><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>A</step><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+    </measure>
+    <measure number="4">
+      <direction placement="below"><direction-type><wedge type="stop"/></direction-type></direction>
+      <note><pitch><step>G</step><octave>5</octave></pitch><duration>8</duration><type>half</type></note>
+      <note><pitch><step>F</step><alter>1</alter><octave>5</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="5">
+      <direction placement="above"><direction-type><rehearsal>A</rehearsal></direction-type></direction>
+      <direction placement="below"><direction-type><dynamics><f/></dynamics></direction-type></direction>
+      <direction placement="above"><direction-type><words>espress.</words></direction-type></direction>
+      <note><pitch><step>E</step><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>E</step><octave>5</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="6">
+      <note><pitch><step>F</step><alter>1</alter><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>E</step><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>5</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="7">
+      <note><pitch><step>E</step><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>F</step><alter>1</alter><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>G</step><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>F</step><alter>1</alter><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+    </measure>
+    <measure number="8">
+      <note><pitch><step>D</step><octave>5</octave></pitch><duration>16</duration><type>whole</type></note>
+      <barline location="right"><bar-style>light-heavy</bar-style></barline>
+    </measure>
+  </part>
+
+  <part id="P2">
+    <measure number="1">
+      <attributes><divisions>4</divisions><key><fifths>2</fifths></key><time><beats>4</beats><beat-type>4</beat-type></time><clef><sign>G</sign><line>2</line></clef></attributes>
+      <direction placement="below"><direction-type><dynamics><mp/></dynamics></direction-type></direction>
+      <note><pitch><step>B</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>A</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>A</step><octave>4</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="2">
+      <note><pitch><step>G</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>A</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>B</step><octave>4</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="3">
+      <note><pitch><step>A</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>G</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>A</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+    </measure>
+    <measure number="4">
+      <note><pitch><step>B</step><octave>4</octave></pitch><duration>8</duration><type>half</type></note>
+      <note><pitch><step>A</step><octave>4</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="5">
+      <direction placement="above"><direction-type><rehearsal>A</rehearsal></direction-type></direction>
+      <direction placement="below"><direction-type><dynamics><f/></dynamics></direction-type></direction>
+      <note><pitch><step>G</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>F</step><alter>1</alter><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>G</step><octave>4</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="6">
+      <note><pitch><step>A</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>G</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>F</step><alter>1</alter><octave>4</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="7">
+      <note><pitch><step>G</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type><notations><articulations><staccato placement="above"/></articulations></notations></note>
+      <note><pitch><step>A</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type><notations><articulations><staccato placement="above"/></articulations></notations></note>
+      <note><pitch><step>B</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type><notations><articulations><staccato placement="above"/></articulations></notations></note>
+      <note><pitch><step>A</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type><notations><articulations><staccato placement="above"/></articulations></notations></note>
+    </measure>
+    <measure number="8">
+      <note><pitch><step>F</step><alter>1</alter><octave>4</octave></pitch><duration>16</duration><type>whole</type></note>
+      <barline location="right"><bar-style>light-heavy</bar-style></barline>
+    </measure>
+  </part>
+
+  <part id="P3">
+    <measure number="1">
+      <attributes><divisions>4</divisions><key><fifths>2</fifths></key><time><beats>4</beats><beat-type>4</beat-type></time><clef><sign>C</sign><line>3</line></clef></attributes>
+      <direction placement="below"><direction-type><dynamics><mp/></dynamics></direction-type></direction>
+      <note><pitch><step>F</step><alter>1</alter><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>G</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>4</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="2">
+      <note><pitch><step>E</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>4</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="3">
+      <note><pitch><step>D</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>E</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>F</step><alter>1</alter><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>F</step><alter>1</alter><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+    </measure>
+    <measure number="4">
+      <note><pitch><step>G</step><octave>4</octave></pitch><duration>8</duration><type>half</type></note>
+      <note><pitch><step>D</step><octave>4</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="5">
+      <direction placement="above"><direction-type><rehearsal>A</rehearsal></direction-type></direction>
+      <direction placement="below"><direction-type><dynamics><f/></dynamics></direction-type></direction>
+      <note><pitch><step>B</step><octave>3</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>A</step><octave>3</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>B</step><octave>3</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="6">
+      <note><pitch><step>D</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>B</step><octave>3</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>A</step><octave>3</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="7">
+      <note><pitch><step>B</step><octave>3</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>E</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+    </measure>
+    <measure number="8">
+      <note><pitch><step>D</step><octave>4</octave></pitch><duration>16</duration><type>whole</type></note>
+      <barline location="right"><bar-style>light-heavy</bar-style></barline>
+    </measure>
+  </part>
+
+  <part id="P4">
+    <measure number="1">
+      <attributes><divisions>4</divisions><key><fifths>2</fifths></key><time><beats>4</beats><beat-type>4</beat-type></time><clef><sign>F</sign><line>4</line></clef></attributes>
+      <direction placement="below"><direction-type><dynamics><mp/></dynamics></direction-type></direction>
+      <note><pitch><step>D</step><octave>3</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>E</step><octave>3</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>3</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="2">
+      <note><pitch><step>G</step><octave>3</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>A</step><octave>3</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>G</step><octave>3</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="3">
+      <note><pitch><step>F</step><alter>1</alter><octave>3</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>G</step><octave>3</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>A</step><octave>3</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+    </measure>
+    <measure number="4">
+      <note><pitch><step>G</step><octave>3</octave></pitch><duration>8</duration><type>half</type></note>
+      <note><pitch><step>D</step><octave>3</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="5">
+      <direction placement="above"><direction-type><rehearsal>A</rehearsal></direction-type></direction>
+      <direction placement="below"><direction-type><dynamics><f/></dynamics></direction-type></direction>
+      <note><pitch><step>E</step><octave>3</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>F</step><alter>1</alter><octave>3</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>G</step><octave>3</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="6">
+      <note><pitch><step>D</step><octave>3</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>G</step><octave>3</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>3</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="7">
+      <note><pitch><step>G</step><octave>3</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>A</step><octave>3</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>B</step><octave>3</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>A</step><octave>3</octave></pitch><duration>4</duration><type>quarter</type></note>
+    </measure>
+    <measure number="8">
+      <note><pitch><step>D</step><octave>3</octave></pitch><duration>16</duration><type>whole</type></note>
+      <barline location="right"><bar-style>light-heavy</bar-style></barline>
+    </measure>
+  </part>
+
+  <part id="P5">
+    <measure number="1">
+      <attributes><divisions>4</divisions><key><fifths>2</fifths></key><time><beats>4</beats><beat-type>4</beat-type></time><clef><sign>F</sign><line>4</line></clef></attributes>
+      <direction placement="below"><direction-type><dynamics><mp/></dynamics></direction-type></direction>
+      <note><pitch><step>D</step><octave>2</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>2</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>2</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="2">
+      <note><pitch><step>G</step><octave>2</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>G</step><octave>2</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>G</step><octave>2</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="3">
+      <note><pitch><step>D</step><octave>2</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>2</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>2</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>2</octave></pitch><duration>4</duration><type>quarter</type></note>
+    </measure>
+    <measure number="4">
+      <note><pitch><step>G</step><octave>2</octave></pitch><duration>8</duration><type>half</type></note>
+      <note><pitch><step>D</step><octave>2</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="5">
+      <direction placement="above"><direction-type><rehearsal>A</rehearsal></direction-type></direction>
+      <direction placement="below"><direction-type><dynamics><f/></dynamics></direction-type></direction>
+      <note><pitch><step>E</step><octave>2</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>E</step><octave>2</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>E</step><octave>2</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="6">
+      <note><pitch><step>D</step><octave>2</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>2</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>2</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+    <measure number="7">
+      <note><pitch><step>G</step><octave>2</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>G</step><octave>2</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>G</step><octave>2</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>G</step><octave>2</octave></pitch><duration>4</duration><type>quarter</type></note>
+    </measure>
+    <measure number="8">
+      <note><pitch><step>D</step><octave>2</octave></pitch><duration>16</duration><type>whole</type></note>
+      <barline location="right"><bar-style>light-heavy</bar-style></barline>
+    </measure>
+  </part>
+</score-partwise>`;
+
+// Sample "Uncertain:" lines, in the same shape the model returns.
+const DEMO_NOTES = [
+  "Violin I, m.2 beat 1: the handwritten G could also read as A — verify against the photo.",
+  "Viola, m.5: the rehearsal-mark letter is smudged; assumed to be A.",
+];
+</script>
+</body>
+</html>
