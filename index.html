@@ -235,6 +235,22 @@
 
 <script>
 "use strict";
+/* --- Startup diagnostics: if anything throws while this page's code runs,
+   show it in the status line instead of failing silently (phones have no
+   console to check). Must be the very first thing in the script. --- */
+window.__ssErrors = [];
+window.__ssStarted = false;
+window.addEventListener("error", (e) => {
+  window.__ssErrors.push(e.message || String((e.error && e.error.message) || e.error || e));
+});
+setTimeout(() => {
+  if (window.__ssStarted) return;
+  const el = document.getElementById("engine-status");
+  const detail = window.__ssErrors.length
+    ? "Error: " + window.__ssErrors[0]
+    : "no error was reported — the page's code may not have run at all.";
+  if (el) el.textContent = "⚠️ The app didn't start. " + detail + " Try reloading the page.";
+}, 4000);
 /* =====================================================================
    ScoreScribe v1 — application logic
    Sections:
@@ -554,6 +570,7 @@ function loadVerovio(attempt) {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  window.__ssStarted = true; // main code is running; cancel the watchdog above
   // Restore saved settings (guarded: some sandboxed viewers block storage)
   try {
     $("api-key").value = localStorage.getItem("ss_key") || "";
