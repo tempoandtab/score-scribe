@@ -47,6 +47,15 @@
   .card h2,.card h3{margin-top:0}
   .hint{color:var(--muted); font-size:.92rem}
   .tiny{color:var(--muted); font-size:.8rem}
+  .info-btn{background:none;border:none;color:var(--accent);font-size:1.05rem;cursor:pointer;padding:0 .15em;line-height:1}
+  .info-btn:hover{opacity:.75}
+  .modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:50;padding:1rem}
+  .modal[hidden]{display:none}
+  .modal-box{background:var(--card);color:var(--ink);border-radius:12px;max-width:26rem;width:100%;padding:1.25rem 1.25rem 1rem;box-shadow:0 12px 40px rgba(0,0,0,.3);max-height:85vh;overflow:auto}
+  .modal-box h3{margin:0 0 .5rem}
+  .modal-box p,.modal-box ol{font-size:.95rem;line-height:1.5}
+  .modal-box ol{padding-left:1.25rem;margin:.5rem 0 1rem}
+  .modal-box .btn{width:100%}
   .btn{
     display:inline-block; border:1px solid #cfc9ba; background:#fff; color:var(--ink);
     border-radius:10px; padding:12px 18px; font-size:1rem; cursor:pointer;
@@ -145,7 +154,7 @@
         <p class="hint">Transcription uses Google's Gemini API <strong>free tier</strong> (no credit card).
           <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Get a free key at Google AI Studio</a>
           and paste it below. The key is stored only in this browser.</p>
-        <label>API key
+        <label>API key <button id="key-info-btn" class="info-btn" type="button" aria-label="What is an API key?">ⓘ</button>
           <input type="password" id="api-key" placeholder="AIza…" autocomplete="off">
         </label>
         <label>Model name
@@ -396,6 +405,13 @@ function getModel() { return ($("model-name").value.trim() || DEFAULT_MODEL); }
 
 function saveSetting(k, v) { try { localStorage.setItem(k, v); } catch (_) { /* ignore */ } }
 $("api-key").addEventListener("input", () => saveSetting("ss_key", $("api-key").value));
+
+// "What's an API key?" info modal.
+const keyModal = $("key-info-modal");
+$("key-info-btn").addEventListener("click", () => { keyModal.hidden = false; });
+$("key-info-close").addEventListener("click", () => { keyModal.hidden = true; });
+keyModal.addEventListener("click", (e) => { if (e.target === keyModal) keyModal.hidden = true; });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") keyModal.hidden = true; });
 $("model-name").addEventListener("input", () => saveSetting("ss_model", $("model-name").value));
 
 /* ---------------- 5. Transcription API ---------------- */
@@ -974,5 +990,19 @@ const DEMO_NOTES = [
   "Viola, m.5: the rehearsal-mark letter is smudged; assumed to be A.",
 ];
 </script>
+<div id="key-info-modal" class="modal" hidden>
+  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="key-info-title">
+    <h3 id="key-info-title">What's an API key?</h3>
+    <p>Think of it as a <strong>password that lets this app use Google's music-reading AI</strong> on your behalf. Without it, the app has no way to send your photo off to be transcribed.</p>
+    <p><strong>It's free.</strong> If you have a Google account (Gmail counts), Google already includes a generous free allowance for this kind of thing — no credit card, no trial, no catch. Reading a page of sheet music uses a tiny fraction of it.</p>
+    <p><strong>Your key stays yours.</strong> It's stored only in this browser on your device, and it's sent to Google — and only to Google — when you tap Transcribe.</p>
+    <ol>
+      <li>Go to <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio</a> and sign in with your Google account.</li>
+      <li>Click <strong>Get API key → Create API key</strong>, then copy it.</li>
+      <li>Paste it into the API key box — about two minutes total, and you're done.</li>
+    </ol>
+    <button id="key-info-close" class="btn" type="button">Got it</button>
+  </div>
+</div>
 </body>
 </html>
