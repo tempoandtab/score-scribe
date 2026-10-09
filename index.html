@@ -233,6 +233,20 @@
   your photos never leave your browser except to the transcription API.
 </footer>
 
+<div id="key-info-modal" class="modal" hidden>
+  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="key-info-title">
+    <h3 id="key-info-title">What's an API key?</h3>
+    <p>Think of it as a <strong>password that lets this app use Google's music-reading AI</strong> on your behalf. Without it, the app has no way to send your photo off to be transcribed.</p>
+    <p><strong>It's free.</strong> If you have a Google account (Gmail counts), Google already includes a generous free allowance for this kind of thing — no credit card, no trial, no catch. Reading a page of sheet music uses a tiny fraction of it.</p>
+    <p><strong>Your key stays yours.</strong> It's stored only in this browser on your device, and it's sent to Google — and only to Google — when you tap Transcribe.</p>
+    <ol>
+      <li>Go to <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio</a> and sign in with your Google account.</li>
+      <li>Click <strong>Get API key → Create API key</strong>, then copy it.</li>
+      <li>Paste it into the API key box — about two minutes total, and you're done.</li>
+    </ol>
+    <button id="key-info-close" class="btn" type="button">Got it</button>
+  </div>
+</div>
 <script>
 "use strict";
 /* --- Startup diagnostics: if anything throws while this page's code runs,
@@ -421,22 +435,7 @@ function getKey()   { return $("api-key").value.trim(); }
 function getModel() { return ($("model-name").value.trim() || DEFAULT_MODEL); }
 
 function saveSetting(k, v) { try { localStorage.setItem(k, v); } catch (_) { /* ignore */ } }
-$("api-key").addEventListener("input", () => {
-  saveSetting("ss_key", $("api-key").value);
-  syncKeyToUrl();
-});
-// Mirror the key into the URL (?key=…) so the link itself carries it and the
-// field loads automatically on any device/browser. NOTE: anyone with that URL
-// has the key — never share such a link.
-function syncKeyToUrl() {
-  try {
-    const url = new URL(location.href);
-    const k = $("api-key").value.trim();
-    if (k) url.searchParams.set("key", k);
-    else url.searchParams.delete("key");
-    history.replaceState(null, "", url.toString());
-  } catch (_) { /* ignore */ }
-}
+$("api-key").addEventListener("input", () => saveSetting("ss_key", $("api-key").value));
 
 // "What's an API key?" info modal.
 const keyModal = $("key-info-modal");
@@ -586,16 +585,9 @@ function loadVerovio(attempt) {
 
 document.addEventListener("DOMContentLoaded", () => {
   window.__ssStarted = true; // main code is running; cancel the watchdog above
-  // Restore saved settings (guarded: some sandboxed viewers block storage).
-  // A ?key=… URL parameter wins over stored settings so a link can carry it.
+  // Restore saved settings (guarded: some sandboxed viewers block storage)
   try {
-    const urlKey = new URLSearchParams(location.search).get("key");
-    if (urlKey) {
-      $("api-key").value = urlKey;
-      saveSetting("ss_key", urlKey);
-    } else {
-      $("api-key").value = localStorage.getItem("ss_key") || "";
-    }
+    $("api-key").value = localStorage.getItem("ss_key") || "";
     $("model-name").value = localStorage.getItem("ss_model") || DEFAULT_MODEL;
   } catch (_) { /* ignore */ }
   loadVerovio(0);
@@ -1039,19 +1031,6 @@ const DEMO_NOTES = [
   "Viola, m.5: the rehearsal-mark letter is smudged; assumed to be A.",
 ];
 </script>
-<div id="key-info-modal" class="modal" hidden>
-  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="key-info-title">
-    <h3 id="key-info-title">What's an API key?</h3>
-    <p>Think of it as a <strong>password that lets this app use Google's music-reading AI</strong> on your behalf. Without it, the app has no way to send your photo off to be transcribed.</p>
-    <p><strong>It's free.</strong> If you have a Google account (Gmail counts), Google already includes a generous free allowance for this kind of thing — no credit card, no trial, no catch. Reading a page of sheet music uses a tiny fraction of it.</p>
-    <p><strong>Your key stays yours.</strong> It's stored only in this browser on your device, and it's sent to Google — and only to Google — when you tap Transcribe.</p>
-    <ol>
-      <li>Go to <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio</a> and sign in with your Google account.</li>
-      <li>Click <strong>Get API key → Create API key</strong>, then copy it.</li>
-      <li>Paste it into the API key box — about two minutes total, and you're done.</li>
-    </ol>
-    <button id="key-info-close" class="btn" type="button">Got it</button>
-  </div>
-</div>
+
 </body>
 </html>
