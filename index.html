@@ -49,6 +49,8 @@
   .tiny{color:var(--muted); font-size:.8rem}
   .info-btn{background:none;border:none;color:var(--accent);font-size:1.05rem;cursor:pointer;padding:0 .15em;line-height:1}
   .info-btn:hover{opacity:.75}
+  .key-label{display:flex;align-items:center;gap:.3rem;margin:10px 0 4px;font-size:.92rem}
+  details#settings .key-label>label{display:inline;margin:0}
   .modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:50;padding:1rem}
   .modal[hidden]{display:none}
   .modal-box{background:var(--card);color:var(--ink);border-radius:12px;max-width:26rem;width:100%;padding:1.25rem 1.25rem 1rem;box-shadow:0 12px 40px rgba(0,0,0,.3);max-height:85vh;overflow:auto}
@@ -154,9 +156,8 @@
         <p class="hint">Transcription uses Google's Gemini API <strong>free tier</strong> (no credit card).
           <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Get a free key at Google AI Studio</a>
           and paste it below. The key is stored only in this browser.</p>
-        <label>API key <button id="key-info-btn" class="info-btn" type="button" aria-label="What is an API key?">ⓘ</button>
-          <input type="password" id="api-key" placeholder="AIza…" autocomplete="off">
-        </label>
+        <div class="key-label"><label for="api-key">API key</label><button id="key-info-btn" class="info-btn" type="button" aria-label="What is an API key?">ⓘ</button></div>
+        <input type="password" id="api-key" placeholder="AIza…" autocomplete="off">
         <label>Model name
           <input type="text" id="model-name" value="gemini-2.5-flash">
         </label>
@@ -511,6 +512,7 @@ function loadVerovio(attempt) {
     if (settled) return;
     settled = true;
     clearTimeout(timer);
+    clearTimeout(slowTimer);
     script.remove();
     if (attempt + 1 < VEROVIO_URLS.length) {
       loadVerovio(attempt + 1); // try the fallback CDN
@@ -519,7 +521,14 @@ function loadVerovio(attempt) {
       setEngineStatus("failed", reason);
     }
   };
-  const timer = setTimeout(() => fail("download timed out"), 60000);
+  const timer = setTimeout(() => fail("download timed out"), 30000);
+  // If the download is just slow (large file, cellular), say so instead of
+  // leaving the generic spinner text up.
+  const slowTimer = setTimeout(() => {
+    if (!settled) {
+      $("engine-status").textContent = "⏳ Still downloading the notation engine… (it's an 8 MB file — slow connections can take a couple of minutes)";
+    }
+  }, 20000);
   // If the engine starts but never signals readiness, treat as failure.
   const readyWatchdog = setTimeout(() => fail("engine started but never became ready"), 90000);
   script.onload = () => {
@@ -528,6 +537,7 @@ function loadVerovio(attempt) {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        clearTimeout(slowTimer);
         clearTimeout(readyWatchdog);
         vrv = new verovio.toolkit();
         vrvReady = true;
