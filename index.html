@@ -421,7 +421,22 @@ function getKey()   { return $("api-key").value.trim(); }
 function getModel() { return ($("model-name").value.trim() || DEFAULT_MODEL); }
 
 function saveSetting(k, v) { try { localStorage.setItem(k, v); } catch (_) { /* ignore */ } }
-$("api-key").addEventListener("input", () => saveSetting("ss_key", $("api-key").value));
+$("api-key").addEventListener("input", () => {
+  saveSetting("ss_key", $("api-key").value);
+  syncKeyToUrl();
+});
+// Mirror the key into the URL (?key=…) so the link itself carries it and the
+// field loads automatically on any device/browser. NOTE: anyone with that URL
+// has the key — never share such a link.
+function syncKeyToUrl() {
+  try {
+    const url = new URL(location.href);
+    const k = $("api-key").value.trim();
+    if (k) url.searchParams.set("key", k);
+    else url.searchParams.delete("key");
+    history.replaceState(null, "", url.toString());
+  } catch (_) { /* ignore */ }
+}
 
 // "What's an API key?" info modal.
 const keyModal = $("key-info-modal");
@@ -571,9 +586,16 @@ function loadVerovio(attempt) {
 
 document.addEventListener("DOMContentLoaded", () => {
   window.__ssStarted = true; // main code is running; cancel the watchdog above
-  // Restore saved settings (guarded: some sandboxed viewers block storage)
+  // Restore saved settings (guarded: some sandboxed viewers block storage).
+  // A ?key=… URL parameter wins over stored settings so a link can carry it.
   try {
-    $("api-key").value = localStorage.getItem("ss_key") || "";
+    const urlKey = new URLSearchParams(location.search).get("key");
+    if (urlKey) {
+      $("api-key").value = urlKey;
+      saveSetting("ss_key", urlKey);
+    } else {
+      $("api-key").value = localStorage.getItem("ss_key") || "";
+    }
     $("model-name").value = localStorage.getItem("ss_model") || DEFAULT_MODEL;
   } catch (_) { /* ignore */ }
   loadVerovio(0);
