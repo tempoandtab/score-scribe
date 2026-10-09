@@ -159,7 +159,7 @@
         <div class="key-label"><label for="api-key">API key</label><button id="key-info-btn" class="info-btn" type="button" aria-label="What is an API key?">ⓘ</button></div>
         <input type="password" id="api-key" placeholder="AIza…" autocomplete="off">
         <label>Model name
-          <input type="text" id="model-name" value="gemini-2.5-flash">
+          <input type="text" id="model-name" value="gemini-3.8-flash">
         </label>
         <p class="tiny">If transcription ever fails with a "model not found" error, check AI Studio for the current model name and update this field.</p>
       </details>
@@ -283,7 +283,7 @@ setTimeout(() => {
 // To swap providers later, rewrite callGemini() and keep its contract:
 //   callGemini(promptText, { includeImage:boolean }) -> Promise<string>
 // Everything downstream only ever sees MusicXML text.
-const DEFAULT_MODEL = "gemini-2.5-flash";
+const DEFAULT_MODEL = "gemini-3.8-flash";
 const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models";
 
 const TRANSCRIBE_PROMPT = `You are a precise music transcription engine. The attached image is a photograph of a HANDWRITTEN full musical score: multiple staves, one staff per instrument (for example a string orchestra score with Violin I, Violin II, Viola, Cello, Double Bass — but the actual instrumentation may differ; read any handwritten instrument labels).
@@ -585,10 +585,13 @@ function loadVerovio(attempt) {
 
 document.addEventListener("DOMContentLoaded", () => {
   window.__ssStarted = true; // main code is running; cancel the watchdog above
-  // Restore saved settings (guarded: some sandboxed viewers block storage)
+  // Restore saved settings (guarded: some sandboxed viewers block storage).
+  // Anyone still on the retired gemini-2.5-flash default is migrated forward.
   try {
     $("api-key").value = localStorage.getItem("ss_key") || "";
-    $("model-name").value = localStorage.getItem("ss_model") || DEFAULT_MODEL;
+    const savedModel = localStorage.getItem("ss_model");
+    $("model-name").value = (!savedModel || savedModel === "gemini-2.5-flash")
+      ? DEFAULT_MODEL : savedModel;
   } catch (_) { /* ignore */ }
   loadVerovio(0);
 });
