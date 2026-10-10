@@ -84,7 +84,6 @@
   .orig-page img{max-width:150px; border-radius:8px; border:1px solid #ddd}
   .orig-page figcaption{font-size:.8rem; color:var(--muted)}
   #part-select{padding:10px; font-size:1rem; border:1px solid #cfc9ba; border-radius:8px; background:#fff; max-width:100%}
-  .print-part-title{text-align:center; margin:0 0 12px}
   details#settings{margin:14px 0; border:1px solid #e2dccb; border-radius:10px; padding:10px 14px; background:#fbf9f4}
   details#settings summary{cursor:pointer; font-weight:600; padding:6px 0}
   details#settings label{display:block; margin:10px 0; font-size:.92rem}
@@ -120,6 +119,8 @@
     body.printing > header, body.printing > main, body.printing > footer, body.printing > #toast{display:none !important}
     #print-area{display:block !important}
     #print-area svg{width:100%; height:auto; page-break-inside:avoid}
+    .print-part{break-before:page; page-break-before:always}
+    .print-part:first-child{break-before:auto; page-break-before:auto}
   }
   footer{text-align:center; color:var(--muted); font-size:.8rem; padding:20px}
   footer a{color:var(--accent)}
@@ -226,6 +227,7 @@
         <div class="row wrap" style="margin-top:10px; align-items:center">
           <select id="part-select" aria-label="Instrument part"></select>
           <button id="print-part-btn" class="btn" type="button">🖨️ Print part</button>
+          <button id="print-all-parts-btn" class="btn" type="button">🖨️ Print all parts</button>
           <button id="export-part-xml" class="btn" type="button">Part MusicXML</button>
         </div>
         <p class="tiny">Print or download a single instrument's part — choose the part first.</p>
@@ -935,14 +937,25 @@ $("export-midi").addEventListener("click", () => {
 
 $("export-svg").addEventListener("click", () => {
   try {
+    // One combined file: browsers block a burst of separate downloads, so all
+    // pages are stacked into a single SVG instead of one file per page.
     const pages = vrv.getPageCount();
+    let inner = "";
+    let totalH = 0;
+    let maxW = 0;
     for (let p = 1; p <= pages; p++) {
       const svg = vrv.renderToSVG(p, {});
-      setTimeout(
-        ((pg, data) => () => download(`score-page-${pg}.svg`, new Blob([data], { type: "image/svg+xml" }))),
-        (p - 1) * 600, p, svg
-      );
+      const w = parseFloat((svg.match(/<svg[^>]*\swidth="([\d.]+)px"/) || [])[1] || 0);
+      const h = parseFloat((svg.match(/<svg[^>]*\sheight="([\d.]+)px"/) || [])[1] || 0);
+      if (!w || !h) throw new Error("Couldn't read the engraved page size.");
+      maxW = Math.max(maxW, w);
+      const content = svg.replace(/^[\s\S]*?<svg[^>]*>/, "").replace(/<\/svg>\s*$/, "");
+      inner += `<svg x="0" y="${totalH}" width="${w}px" height="${h}px">${content}</svg>`;
+      totalH += h;
     }
+    const doc = `<svg xmlns="http://www.w3.org/2000/svg" width="${maxW}px" height="${totalH}px">${inner}</svg>`;
+    download("score.svg", new Blob([doc], { type: "image/svg+xml" }));
+    toast(`SVG downloaded${pages > 1 ? ` (${pages} pages in one file)` : ""}.`);
     setStep(4);
   } catch (err) {
     toast("SVG export failed: " + err.message);
@@ -1001,20 +1014,42 @@ $("print-part-btn").addEventListener("click", () => {
   const sel = $("part-select");
   if (!sel.value) { toast("Choose a part first."); return; }
   try {
-    const partXml = extractPartXml(state.musicXml, sel.value);
-    const pv = new verovio.toolkit(); // separate engraver so the full score stays loaded
-    pv.loadData(partXml);
-    let html = "";
-    for (let p = 1; p <= pv.getPageCount(); p++) html += pv.renderToSVG(p, {});
-    const name = sel.options[sel.selectedIndex].textContent;
-    $("print-area").innerHTML = `<h2 class="print-part-title">${escapeHtml(name)}</h2>` + html;
-    document.body.classList.add("printing");
-    window.print();
+    printParts([sel.value]);
   } catch (err) {
     console.error(err);
     toast("Couldn't print that part: " + err.message);
   }
 });
+$("print-all-parts-btn").addEventListener("click", () => {
+  const parts = listParts();
+  if (!parts.length) { toast("No parts to print."); return; }
+  try {
+    printParts(parts.map((p) => p.id));
+    toast(`Printing ${parts.length} parts — each starts on its own page.`);
+  } catch (err) {
+    console.error(err);
+    toast("Couldn't print parts: " + err.message);
+  }
+});
+// Engrave each listed part and send them to the print area, one part per
+// printed page (CSS .print-part handles the page breaks).
+function printParts(partIds) {
+  const host = $("print-area");
+  host.innerHTML = "";
+  partIds.forEach((pid) => {
+    const partXml = extractPartXml(state.musicXml, pid);
+    const pv = new verovio.toolkit(); // separate engraver so the full score stays loaded
+    pv.loadData(partXml);
+    const div = document.createElement("div");
+    div.className = "print-part";
+    let html = "";
+    for (let p = 1; p <= pv.getPageCount(); p++) html += pv.renderToSVG(p, {});
+    div.innerHTML = html;
+    host.appendChild(div);
+  });
+  document.body.classList.add("printing");
+  window.print();
+}
 $("export-part-xml").addEventListener("click", () => {
   const sel = $("part-select");
   if (!sel.value) { toast("Choose a part first."); return; }
