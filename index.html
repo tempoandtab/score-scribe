@@ -118,9 +118,10 @@
   @media print{
     body.printing > header, body.printing > main, body.printing > footer, body.printing > #toast{display:none !important}
     #print-area{display:block !important}
-    #print-area svg{width:100%; height:auto; page-break-inside:avoid}
-    .print-part{break-before:page; page-break-before:always}
+    #print-area svg{width:99.5%; height:auto; page-break-inside:avoid}
+    .print-part{break-before:page; page-break-before:always; position:relative}
     .print-part:first-child{break-before:auto; page-break-before:auto}
+    .print-credit{position:absolute; bottom:6mm; left:0; right:0; text-align:center; font-size:10pt; color:#555; margin:0}
   }
   footer{text-align:center; color:var(--muted); font-size:.8rem; padding:20px}
   footer a{color:var(--accent)}
@@ -963,7 +964,14 @@ $("export-svg").addEventListener("click", () => {
 });
 
 $("export-pdf").addEventListener("click", () => {
-  $("print-area").innerHTML = $("score-pages").innerHTML;
+  // Re-engrave at Letter proportions so each printed page fits its sheet
+  // (same spillover fix as part printing).
+  const pv = new verovio.toolkit();
+  pv.setOptions({ pageWidth: PRINT_PAGE_W, pageHeight: PRINT_PAGE_H });
+  pv.loadData(state.musicXml);
+  let html = "";
+  for (let p = 1; p <= pv.getPageCount(); p++) html += pv.renderToSVG(p, {});
+  $("print-area").innerHTML = html;
   document.body.classList.add("printing");
   window.print();
 });
@@ -1033,17 +1041,25 @@ $("print-all-parts-btn").addEventListener("click", () => {
 });
 // Engrave each listed part and send them to the print area, one part per
 // printed page (CSS .print-part handles the page breaks).
+// Print pages are engraved at US Letter proportions (8.5 x 11) so each page
+// fits its printed sheet exactly -- Verovio's default page is A4-shaped
+// (taller), which spills the footer onto a blank extra page on Letter paper.
+const PRINT_PAGE_W = 2100;
+const PRINT_PAGE_H = Math.round(PRINT_PAGE_W * 11 / 8.5);
 function printParts(partIds) {
   const host = $("print-area");
   host.innerHTML = "";
-  partIds.forEach((pid) => {
+  partIds.forEach((pid, idx) => {
     const partXml = extractPartXml(state.musicXml, pid);
     const pv = new verovio.toolkit(); // separate engraver so the full score stays loaded
+    pv.setOptions({ pageWidth: PRINT_PAGE_W, pageHeight: PRINT_PAGE_H, footer: "none" });
     pv.loadData(partXml);
     const div = document.createElement("div");
     div.className = "print-part";
     let html = "";
     for (let p = 1; p <= pv.getPageCount(); p++) html += pv.renderToSVG(p, {});
+    // One attribution line for the whole printout, at the very end.
+    if (idx === partIds.length - 1) html += `<p class="print-credit">Engraved with Verovio</p>`;
     div.innerHTML = html;
     host.appendChild(div);
   });
