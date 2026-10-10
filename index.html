@@ -72,8 +72,19 @@
   .row.wrap .btn{flex:1 1 140px}
   .divider{display:flex; align-items:center; gap:10px; color:var(--muted); margin:14px 0}
   .divider::before,.divider::after{content:""; flex:1; height:1px; background:#ddd6c6}
-  #preview-wrap{margin-top:14px}
-  #preview{max-width:100%; border-radius:8px; border:1px solid #ddd; max-height:60vh}
+  #pages-wrap{margin-top:14px}
+  #pages-list{display:flex; flex-direction:column; gap:10px}
+  .page-card{display:flex; gap:12px; align-items:center; background:#fbf9f4; border:1px solid #e2dccb; border-radius:10px; padding:8px}
+  .page-card img{width:72px; height:96px; object-fit:cover; border-radius:6px; border:1px solid #ddd}
+  .page-card .page-num{font-weight:600; flex:1}
+  .page-card .mini{border:1px solid #cfc9ba; background:#fff; border-radius:8px; padding:6px 10px; font-size:1rem; cursor:pointer}
+  .page-card .mini.danger{color:var(--danger); border-color:#e3b7b0}
+  #original-imgs{display:flex; flex-wrap:wrap; gap:10px}
+  .orig-page{margin:0; text-align:center}
+  .orig-page img{max-width:150px; border-radius:8px; border:1px solid #ddd}
+  .orig-page figcaption{font-size:.8rem; color:var(--muted)}
+  #part-select{padding:10px; font-size:1rem; border:1px solid #cfc9ba; border-radius:8px; background:#fff; max-width:100%}
+  .print-part-title{text-align:center; margin:0 0 12px}
   details#settings{margin:14px 0; border:1px solid #e2dccb; border-radius:10px; padding:10px 14px; background:#fbf9f4}
   details#settings summary{cursor:pointer; font-weight:600; padding:6px 0}
   details#settings label{display:block; margin:10px 0; font-size:.92rem}
@@ -83,7 +94,6 @@
   @media (max-width:760px){ .panels{grid-template-columns:1fr} }
   .panel{background:var(--card); border-radius:var(--radius); padding:16px; box-shadow:0 2px 10px rgba(0,0,0,.06)}
   .panel h3{margin:0 0 10px}
-  #original-img{max-width:100%; border-radius:8px; border:1px solid #ddd}
   #score-pages svg{width:100%; height:auto; background:#fff; border:1px solid #eee; border-radius:8px; margin-bottom:10px}
   #uncertainty-card{border-left:5px solid var(--warn); background:var(--warn-bg)}
   #uncertainty-list{margin:6px 0; padding-left:20px}
@@ -137,18 +147,14 @@
   <section id="view-upload">
     <div class="card">
       <h2>Photograph the handwritten score</h2>
-      <p class="hint">One page per photo. Lay the page flat, fill the frame, and avoid shadows. Works with full scores (multiple staves) — one staff becomes one part.</p>
+      <p class="hint">One photo per page, in page order. Lay each page flat, fill the frame, and avoid shadows. Works with full scores (multiple staves) — one staff becomes one part.</p>
 
-      <label class="btn primary big" for="file-input">📷 Take photo / Upload image</label>
-      <input type="file" id="file-input" accept="image/*" capture="environment" hidden>
+      <label class="btn primary big" for="file-input">📷 Take photo / Upload images</label>
+      <input type="file" id="file-input" accept="image/*" capture="environment" hidden multiple>
+      <p class="tiny" style="text-align:center">Tip: on a phone, tap the button once per page; on a computer you can pick several photos at once.</p>
 
-      <div id="preview-wrap" hidden>
-        <img id="preview" alt="Score photo preview">
-        <div class="row">
-          <button id="rotate-left" class="btn" type="button">⟲ Rotate left</button>
-          <button id="rotate-right" class="btn" type="button">⟳ Rotate right</button>
-          <button id="remove-photo" class="btn danger-ghost" type="button">Remove</button>
-        </div>
+      <div id="pages-wrap" hidden>
+        <div id="pages-list"></div>
       </div>
 
       <details id="settings">
@@ -184,9 +190,9 @@
     <div id="review" hidden>
       <div class="panels">
         <div class="panel">
-          <h3>🖼️ Original photo</h3>
-          <img id="original-img" alt="Original handwritten score">
-          <p class="tiny" id="demo-photo-note" hidden>Demo mode — your photo would appear here.</p>
+          <h3>🖼️ Original pages</h3>
+          <div id="original-imgs"></div>
+          <p class="tiny" id="demo-photo-note" hidden>Demo mode — your photos would appear here.</p>
         </div>
         <div class="panel">
           <h3>🎼 Engraved score</h3>
@@ -217,6 +223,12 @@
           <button id="export-pdf" class="btn" type="button">Print / PDF</button>
         </div>
         <p class="tiny">MusicXML opens in MuseScore, Dorico, Finale &amp; Sibelius. Print uses your browser's print dialog — choose "Save as PDF".</p>
+        <div class="row wrap" style="margin-top:10px; align-items:center">
+          <select id="part-select" aria-label="Instrument part"></select>
+          <button id="print-part-btn" class="btn" type="button">🖨️ Print part</button>
+          <button id="export-part-xml" class="btn" type="button">Part MusicXML</button>
+        </div>
+        <p class="tiny">Print or download a single instrument's part — choose the part first.</p>
       </div>
 
       <button id="start-over" class="btn danger-ghost" type="button">← Start over with a new photo</button>
@@ -303,11 +315,23 @@ Output format, exactly:
 2. After the fence, a short list headed "Uncertain:" — one line per doubtful spot, e.g. "Violin I, m.7 beat 3: could be F# or G eighth note". If nothing was doubtful, write "Uncertain: none".
 No other commentary.`;
 
-function correctionPrompt(userText, currentXml, hasImage) {
+// For multi-page scores: each page is transcribed separately, then the pages
+// are joined by mergePageXml(). The model numbers measures from 1 per page
+// and must keep part names identical across pages.
+function pagePrompt(i, n) {
+  if (n === 1) return TRANSCRIBE_PROMPT;
+  return TRANSCRIBE_PROMPT +
+    `\n\nThis image is page ${i + 1} of ${n} of the same handwritten score. Transcribe ONLY the measures visible on this page, numbered from 1 within this page. Every page has the same instruments in the same top-to-bottom order — use identical part names on every page.`;
+}
+
+function correctionPrompt(userText, currentXml, hasImage, pageCount) {
   const source = hasImage
     ? "You previously transcribed the attached photograph of a handwritten full score into MusicXML."
     : "You previously produced the MusicXML transcription below (no photo is attached this time).";
-  return `${source} The user — a music teacher comparing your transcription against the photo — reports these errors:
+  const scope = pageCount > 1
+    ? ` The transcription joins ${pageCount} photographed pages with continuous measure numbers across the whole score.`
+    : "";
+  return `${source}${scope} The user — a music teacher comparing your transcription against the photo — reports these errors:
 
 ${userText}
 
@@ -321,8 +345,8 @@ Return the FULL corrected MusicXML document in ONE \`\`\`xml code fence (output 
 
 /* ---------------- 2. State & tiny helpers ---------------- */
 const state = {
-  imageDataUrl: null,   // resized photo as data URL (for display)
-  imageB64: null,       // same photo, raw base64 (for the API)
+  pages: [],            // [{ dataUrl, b64 }] — one per photographed page, in order
+  imageB64: null,       // the page photo currently being sent to the API
   isDemo: false,
   musicXml: null,
   notes: [],            // "Uncertain:" lines from the model
@@ -365,10 +389,10 @@ function escapeHtml(s) {
 /* ---------------- 3. Photo handling ---------------- */
 const MAX_SIDE = 1600; // downscale so uploads stay fast & API images stay cheap
 
-$("file-input").addEventListener("change", (e) => {
-  const file = e.target.files && e.target.files[0];
-  if (file) loadImageFile(file);
+$("file-input").addEventListener("change", async (e) => {
+  const files = e.target.files ? [...e.target.files] : [];
   e.target.value = ""; // allow re-picking the same file
+  for (const file of files) await loadImageFile(file); // sequential: keeps page order
 });
 
 async function loadImageFile(file) {
@@ -391,24 +415,55 @@ async function loadImageFile(file) {
     canvas.height = Math.round(bmp.height * scale);
     canvas.getContext("2d").drawImage(bmp, 0, 0, canvas.width, canvas.height);
     if (bmp.close) bmp.close();
-    setPhoto(canvas.toDataURL("image/jpeg", 0.88));
+    addPage(canvas.toDataURL("image/jpeg", 0.88));
   } catch (err) {
     toast("Couldn't read that image. Try a different photo.");
   }
 }
 
-function setPhoto(dataUrl) {
-  state.imageDataUrl = dataUrl;
-  state.imageB64 = dataUrl.split(",")[1];
+function addPage(dataUrl) {
+  state.pages.push({ dataUrl, b64: dataUrl.split(",")[1] });
   state.isDemo = false;
-  $("preview").src = dataUrl;
-  $("preview-wrap").hidden = false;
+  renderPagesList();
   updateActionButtons();
 }
 
-function rotatePhoto(dir) {
+function renderPagesList() {
+  const list = $("pages-list");
+  list.innerHTML = "";
+  state.pages.forEach((p, i) => {
+    const card = document.createElement("div");
+    card.className = "page-card";
+    const img = document.createElement("img");
+    img.src = p.dataUrl;
+    img.alt = `Page ${i + 1}`;
+    const num = document.createElement("span");
+    num.className = "page-num";
+    num.textContent = `Page ${i + 1}`;
+    const mkBtn = (label, title, cls, fn) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "mini" + (cls ? " " + cls : "");
+      b.textContent = label;
+      b.title = title;
+      b.addEventListener("click", fn);
+      return b;
+    };
+    card.append(
+      img, num,
+      mkBtn("⟲", "Rotate left", "", () => rotatePage(i, -1)),
+      mkBtn("⟳", "Rotate right", "", () => rotatePage(i, 1)),
+      mkBtn("✕", "Remove page", "danger", () => removePage(i))
+    );
+    list.appendChild(card);
+  });
+  $("pages-wrap").hidden = state.pages.length === 0;
+}
+
+function rotatePage(index, dir) {
   // dir: +1 = clockwise, -1 = counter-clockwise
-  if (!state.imageDataUrl) return;
+  const page = state.pages[index];
+  if (!page) return;
   const img = new Image();
   img.onload = () => {
     const canvas = document.createElement("canvas");
@@ -418,17 +473,19 @@ function rotatePhoto(dir) {
     ctx.translate(canvas.width / 2, canvas.height / 2);
     ctx.rotate(dir * Math.PI / 2);
     ctx.drawImage(img, -img.width / 2, -img.height / 2);
-    setPhoto(canvas.toDataURL("image/jpeg", 0.88));
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.88);
+    page.dataUrl = dataUrl;
+    page.b64 = dataUrl.split(",")[1];
+    renderPagesList();
   };
-  img.src = state.imageDataUrl;
+  img.src = page.dataUrl;
 }
-$("rotate-left").addEventListener("click", () => rotatePhoto(-1));
-$("rotate-right").addEventListener("click", () => rotatePhoto(1));
-$("remove-photo").addEventListener("click", () => {
-  state.imageDataUrl = state.imageB64 = null;
-  $("preview-wrap").hidden = true;
+
+function removePage(index) {
+  state.pages.splice(index, 1);
+  renderPagesList();
   updateActionButtons();
-});
+}
 
 /* ---------------- 4. Settings (API key) ---------------- */
 function getKey()   { return $("api-key").value.trim(); }
@@ -515,6 +572,65 @@ function parseTranscription(raw) {
   return { xml, notes };
 }
 
+const XML_PROLOG = '<?xml version="1.0" encoding="UTF-8"?>\n';
+
+// Join per-page transcriptions into one score: parts are matched across pages
+// by normalized name (falling back to position), measures concatenated per
+// part and renumbered continuously.
+function mergePageXml(xmlStrings) {
+  if (xmlStrings.length === 1) return xmlStrings[0];
+  const docs = xmlStrings.map((s, i) => {
+    const d = new DOMParser().parseFromString(s, "application/xml");
+    if (d.querySelector("parsererror")) throw new Error(`Page ${i + 1}: the transcription didn't parse as MusicXML.`);
+    return d;
+  });
+  const norm = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const partNameOf = (doc, id) => {
+    const parts = doc.getElementsByTagName("score-part");
+    for (const sp of parts) {
+      if (sp.getAttribute("id") === id) {
+        const nm = sp.getElementsByTagName("part-name")[0];
+        return (nm && nm.textContent.trim()) || id;
+      }
+    }
+    return id;
+  };
+  const docParts = (doc) => [...doc.documentElement.children].filter((c) => c.tagName === "part");
+  const baseIds = docParts(docs[0]).map((p) => p.getAttribute("id"));
+  const baseNames = baseIds.map((id) => norm(partNameOf(docs[0], id)));
+
+  const merged = docs[0].cloneNode(true);
+  const dstById = {};
+  docParts(merged).forEach((p) => { p.textContent = ""; dstById[p.getAttribute("id")] = p; });
+  const nextNo = {};
+  baseIds.forEach((id) => { nextNo[id] = 1; });
+
+  docs.forEach((doc, pi) => {
+    const pageIds = docParts(doc).map((p) => p.getAttribute("id"));
+    if (pageIds.length !== baseIds.length) {
+      throw new Error(`Page ${pi + 1} has ${pageIds.length} parts but page 1 has ${baseIds.length}. Make sure every photo is of the same score.`);
+    }
+    const pageNames = pageIds.map((id) => norm(partNameOf(doc, id)));
+    const used = new Set();
+    pageIds.forEach((pid, idx) => {
+      let target = baseNames.indexOf(pageNames[idx]);
+      if (target === -1 || used.has(target)) target = idx; // fall back to position
+      used.add(target);
+      const baseId = baseIds[target];
+      const src = docParts(doc).find((p) => p.getAttribute("id") === pid);
+      const dst = dstById[baseId];
+      [...src.children]
+        .filter((c) => c.tagName === "measure")
+        .forEach((m) => {
+          const copy = m.cloneNode(true);
+          copy.setAttribute("number", String(nextNo[baseId]++));
+          dst.appendChild(copy);
+        });
+    });
+  });
+  return XML_PROLOG + new XMLSerializer().serializeToString(merged);
+}
+
 /* ---------------- 6. Engraving (Verovio) ---------------- */
 // Two CDNs for the engine: the official build, then the npm package via
 // jsDelivr as a fallback. Loading is dynamic so failures are visible and
@@ -525,7 +641,9 @@ const VEROVIO_URLS = [
 ];
 
 function updateActionButtons() {
-  $("transcribe-btn").disabled = !(state.imageB64 && vrvReady);
+  const n = state.pages.length;
+  $("transcribe-btn").disabled = !(n > 0 && vrvReady);
+  $("transcribe-btn").textContent = n > 1 ? `Transcribe ${n} pages →` : "Transcribe →";
   $("demo-btn").disabled = !vrvReady;
 }
 
@@ -656,25 +774,36 @@ function showReview() {
   $("progress").hidden = true;
   $("review").hidden = false;
   setStep(3);
+  refreshPartList();
   $("pill-4").classList.add("done"); // export is part of the review screen
 }
 
 $("transcribe-btn").addEventListener("click", async () => {
-  if (!state.imageB64) { toast("Add a photo first."); return; }
+  if (!state.pages.length) { toast("Add at least one page photo first."); return; }
   if (!getKey()) { toast("Add your free Gemini API key under Settings first (or try the demo)."); return; }
   showWorking();
-  showProgress("Reading your handwriting…");
   try {
-    const raw = await callGemini(TRANSCRIBE_PROMPT, true, (attempt) => {
+    const n = state.pages.length;
+    const busyMsg = (attempt) => {
       $("progress-text").textContent = `Google's servers are busy — retrying (attempt ${attempt + 1} of 4)…`;
-    });
-    const { xml, notes } = parseTranscription(raw);
-    state.musicXml = xml;
+    };
+    const xmls = [];
+    const notes = [];
+    for (let i = 0; i < n; i++) {
+      showProgress(n > 1 ? `Reading page ${i + 1} of ${n}…` : "Reading your handwriting…");
+      state.imageB64 = state.pages[i].b64; // the active photo for this request
+      const raw = await callGemini(pagePrompt(i, n), true, busyMsg);
+      const parsed = parseTranscription(raw);
+      xmls.push(parsed.xml);
+      const prefix = n > 1 ? `p.${i + 1}: ` : "";
+      parsed.notes.forEach((nt) => notes.push(prefix + nt));
+    }
+    state.musicXml = mergePageXml(xmls);
     state.notes = notes;
     state.isDemo = false;
     state.corrections = [];
     $("correction-history").innerHTML = "";
-    $("original-img").src = state.imageDataUrl;
+    renderOriginalPhotos();
     $("demo-photo-note").hidden = true;
     renderScore();
     showReview();
@@ -686,6 +815,26 @@ $("transcribe-btn").addEventListener("click", async () => {
     toast("Transcription failed: " + err.message, 7000);
   }
 });
+
+// Thumbnails of the photographed pages on the review screen.
+function renderOriginalPhotos() {
+  const host = $("original-imgs");
+  host.innerHTML = "";
+  state.pages.forEach((p, i) => {
+    const fig = document.createElement("figure");
+    fig.className = "orig-page";
+    const img = document.createElement("img");
+    img.src = p.dataUrl;
+    img.alt = `Page ${i + 1} of the handwritten score`;
+    fig.appendChild(img);
+    if (state.pages.length > 1) {
+      const cap = document.createElement("figcaption");
+      cap.textContent = `Page ${i + 1}`;
+      fig.appendChild(cap);
+    }
+    host.appendChild(fig);
+  });
+}
 
 $("apply-correction").addEventListener("click", async () => {
   const text = $("correction-input").value.trim();
@@ -700,11 +849,13 @@ $("apply-correction").addEventListener("click", async () => {
   btn.textContent = "Applying…";
   showProgress("Applying your correction…", 3);
   try {
-    // In demo mode there is no photo, so the correction is applied to the
-    // MusicXML alone; with a real transcription the photo is re-sent too.
+    // The photo is re-sent only for single-page transcriptions. In demo mode
+    // or with several pages the model works from the MusicXML alone.
+    const withPhoto = !state.isDemo && state.pages.length === 1;
+    if (withPhoto) state.imageB64 = state.pages[0].b64;
     const raw = await callGemini(
-      correctionPrompt(text, state.musicXml, !state.isDemo),
-      !state.isDemo,
+      correctionPrompt(text, state.musicXml, withPhoto, state.pages.length),
+      withPhoto,
       (attempt) => { $("progress-text").textContent = `Google's servers are busy — retrying (attempt ${attempt + 1} of 4)…`; }
     );
     const { xml, notes } = parseTranscription(raw);
@@ -737,7 +888,7 @@ $("demo-btn").addEventListener("click", () => {
     state.notes = DEMO_NOTES.slice();
     state.corrections = [];
     $("correction-history").innerHTML = "";
-    $("original-img").removeAttribute("src");
+    $("original-imgs").innerHTML = "";
     $("demo-photo-note").hidden = false;
     try {
       renderScore();
@@ -755,6 +906,11 @@ $("start-over").addEventListener("click", () => {
   $("view-upload").hidden = false;
   $("progress").hidden = true;
   $("review").hidden = true;
+  state.pages = [];
+  state.imageB64 = null;
+  state.musicXml = null;
+  renderPagesList();
+  updateActionButtons();
   setStep(1);
   window.scrollTo({ top: 0, behavior: "smooth" });
 });
@@ -799,6 +955,79 @@ $("export-pdf").addEventListener("click", () => {
   window.print();
 });
 window.addEventListener("afterprint", () => document.body.classList.remove("printing"));
+
+/* ---------------- Parts ---------------- */
+// List the instruments in the current transcription for the part picker.
+function listParts() {
+  if (!state.musicXml) return [];
+  const doc = new DOMParser().parseFromString(state.musicXml, "application/xml");
+  const pl = doc.getElementsByTagName("part-list")[0];
+  if (!pl) return [];
+  const out = [];
+  for (const ch of pl.children) {
+    if (ch.tagName !== "score-part") continue;
+    const nm = ch.getElementsByTagName("part-name")[0];
+    out.push({ id: ch.getAttribute("id"), name: (nm && nm.textContent.trim()) || ch.getAttribute("id") });
+  }
+  return out;
+}
+function refreshPartList() {
+  const sel = $("part-select");
+  sel.innerHTML = "";
+  listParts().forEach((p) => {
+    const o = document.createElement("option");
+    o.value = p.id;
+    o.textContent = p.name;
+    sel.appendChild(o);
+  });
+}
+// Build a single-part MusicXML document from the full score.
+function extractPartXml(xmlStr, partId) {
+  const doc = new DOMParser().parseFromString(xmlStr, "application/xml");
+  if (doc.querySelector("parsererror")) throw new Error("Couldn't parse the score.");
+  const pl = doc.getElementsByTagName("part-list")[0];
+  if (pl) {
+    [...pl.children].forEach((ch) => {
+      if (ch.tagName === "score-part" && ch.getAttribute("id") !== partId) ch.remove();
+      if (ch.tagName === "part-group") ch.remove(); // brackets span parts; drop them
+    });
+  }
+  [...doc.documentElement.children].forEach((ch) => {
+    if (ch.tagName === "part" && ch.getAttribute("id") !== partId) ch.remove();
+  });
+  return XML_PROLOG + new XMLSerializer().serializeToString(doc);
+}
+$("print-part-btn").addEventListener("click", () => {
+  const sel = $("part-select");
+  if (!sel.value) { toast("Choose a part first."); return; }
+  try {
+    const partXml = extractPartXml(state.musicXml, sel.value);
+    const pv = new verovio.toolkit(); // separate engraver so the full score stays loaded
+    pv.loadData(partXml);
+    let html = "";
+    for (let p = 1; p <= pv.getPageCount(); p++) html += pv.renderToSVG(p, {});
+    const name = sel.options[sel.selectedIndex].textContent;
+    $("print-area").innerHTML = `<h2 class="print-part-title">${escapeHtml(name)}</h2>` + html;
+    document.body.classList.add("printing");
+    window.print();
+  } catch (err) {
+    console.error(err);
+    toast("Couldn't print that part: " + err.message);
+  }
+});
+$("export-part-xml").addEventListener("click", () => {
+  const sel = $("part-select");
+  if (!sel.value) { toast("Choose a part first."); return; }
+  try {
+    const partXml = extractPartXml(state.musicXml, sel.value);
+    const name = sel.options[sel.selectedIndex].textContent
+      .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "part";
+    download(`${name}.musicxml`, new Blob([partXml], { type: "application/xml" }));
+  } catch (err) {
+    console.error(err);
+    toast("Couldn't export that part: " + err.message);
+  }
+});
 
 /* ---------------- 8. Demo data ---------------- */
 // A short original string-orchestra excerpt (D major, 4/4), encoded by hand
