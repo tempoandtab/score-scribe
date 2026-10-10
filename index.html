@@ -446,8 +446,10 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape") keyModal.h
 $("model-name").addEventListener("input", () => saveSetting("ss_model", $("model-name").value));
 
 /* ---------------- 5. Transcription API ---------------- */
-// Contract: prompt text (+ optional photo) in, raw model text out.
-async function callGemini(promptText, includeImage) {
+// Contract: callGemini(promptText, includeImage, onRetry?) -> Promise<string>.
+// Retries rate-limit (429), overloaded (503), and network errors with
+// exponential backoff; other failures throw immediately.
+async function callGemini(promptText, includeImage, onRetry) {
   const key = getKey();
   if (!key) throw new Error("Add your free Gemini API key under Settings first (or try the demo).");
   const url = `${GEMINI_ENDPOINT}/${encodeURIComponent(getModel())}:generateContent?key=${encodeURIComponent(key)}`;
@@ -456,23 +458,39 @@ async function callGemini(promptText, includeImage) {
     if (!state.imageB64) throw new Error("No photo loaded.");
     parts.push({ inline_data: { mime_type: "image/jpeg", data: state.imageB64 } });
   }
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts }],
-      generationConfig: { temperature: 0.15, maxOutputTokens: 32768 },
-    }),
+  const body = JSON.stringify({
+    contents: [{ role: "user", parts }],
+    generationConfig: { temperature: 0.15, maxOutputTokens: 32768 },
   });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const msg = (data.error && data.error.message) || `Request failed (HTTP ${res.status})`;
-    throw new Error(msg);
+  const MAX_ATTEMPTS = 4;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const msg = (data.error && data.error.message) || `Request failed (HTTP ${res.status})`;
+        const err = new Error(msg);
+        err.retryable = (res.status === 429 || res.status === 503);
+        throw err;
+      }
+      const text = (data.candidates?.[0]?.content?.parts || [])
+        .map((p) => p.text || "").join("");
+      if (!text) throw new Error("The model returned an empty response. Try again.");
+      return text;
+    } catch (err) {
+      lastErr = err;
+      const retryable = err.retryable || err instanceof TypeError; // TypeError = network failure
+      if (!retryable || attempt === MAX_ATTEMPTS) throw err;
+      if (onRetry) { try { onRetry(attempt); } catch (_) {} }
+      await new Promise((r) => setTimeout(r, 1500 * 2 ** (attempt - 1)));
+    }
   }
-  const text = (data.candidates?.[0]?.content?.parts || [])
-    .map((p) => p.text || "").join("");
-  if (!text) throw new Error("The model returned an empty response. Try again.");
-  return text;
+  throw lastErr;
 }
 
 // Pull the ```xml fence out of the model's reply; the rest is the
@@ -628,11 +646,11 @@ function showWorking() {
   $("view-working").hidden = false;
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
-function showProgress(text) {
+function showProgress(text, step) {
   $("progress").hidden = false;
   $("review").hidden = true;
   $("progress-text").textContent = text;
-  setStep(2);
+  setStep(step || 2);
 }
 function showReview() {
   $("progress").hidden = true;
@@ -647,7 +665,9 @@ $("transcribe-btn").addEventListener("click", async () => {
   showWorking();
   showProgress("Reading your handwriting…");
   try {
-    const raw = await callGemini(TRANSCRIBE_PROMPT, true);
+    const raw = await callGemini(TRANSCRIBE_PROMPT, true, (attempt) => {
+      $("progress-text").textContent = `Google's servers are busy — retrying (attempt ${attempt + 1} of 4)…`;
+    });
     const { xml, notes } = parseTranscription(raw);
     state.musicXml = xml;
     state.notes = notes;
@@ -678,10 +698,15 @@ $("apply-correction").addEventListener("click", async () => {
   btn.disabled = true;
   const oldLabel = btn.textContent;
   btn.textContent = "Applying…";
+  showProgress("Applying your correction…", 3);
   try {
     // In demo mode there is no photo, so the correction is applied to the
     // MusicXML alone; with a real transcription the photo is re-sent too.
-    const raw = await callGemini(correctionPrompt(text, state.musicXml, !state.isDemo), !state.isDemo);
+    const raw = await callGemini(
+      correctionPrompt(text, state.musicXml, !state.isDemo),
+      !state.isDemo,
+      (attempt) => { $("progress-text").textContent = `Google's servers are busy — retrying (attempt ${attempt + 1} of 4)…`; }
+    );
     const { xml, notes } = parseTranscription(raw);
     state.musicXml = xml;
     state.notes = notes;
@@ -691,9 +716,11 @@ $("apply-correction").addEventListener("click", async () => {
     $("correction-history").appendChild(li);
     $("correction-input").value = "";
     renderScore();
+    showReview();
     toast("Correction applied — score re-engraved.");
   } catch (err) {
     console.error(err);
+    showReview();
     toast("Correction failed: " + err.message, 7000);
   } finally {
     btn.disabled = false;
