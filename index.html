@@ -14,8 +14,9 @@
   Verovio CDN + the Gemini API). Or host the file on GitHub Pages / Netlify.
 
   To vibe-code on it later: each section below is commented. The recognition
-  layer is just `callGemini()` — swap the model or provider there and nothing
-  downstream changes (image in → MusicXML out).
+  layer is just `callGemini()` — it dispatches to the cloud (Gemini) or the
+  on-device engine based on state.engine, and nothing downstream changes
+  (image in → MusicXML out).
 -->
 <style>
   :root{
@@ -51,6 +52,9 @@
   .info-btn:hover{opacity:.75}
   .key-label{display:flex;align-items:center;gap:.3rem;margin:10px 0 4px;font-size:.92rem}
   details#settings .key-label>label{display:inline;margin:0}
+  .engine-pick{display:flex;flex-direction:column;gap:6px;margin:8px 0 4px}
+  .engine-pick>label{display:flex;gap:8px;align-items:baseline;cursor:pointer;font-size:.95rem}
+  .engine-pick input[type=radio]{accent-color:var(--accent);margin:0}
   .modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:50;padding:1rem}
   .modal[hidden]{display:none}
   .modal-box{background:var(--card);color:var(--ink);border-radius:12px;max-width:26rem;width:100%;padding:1.25rem 1.25rem 1rem;box-shadow:0 12px 40px rgba(0,0,0,.3);max-height:85vh;overflow:auto}
@@ -160,7 +164,12 @@
       </div>
 
       <details id="settings">
-        <summary>⚙️ Settings — free transcription key</summary>
+        <summary>⚙️ Settings — transcription engine</summary>
+        <div class="engine-pick" role="radiogroup" aria-label="Transcription engine">
+          <label><input type="radio" name="engine" value="cloud" checked> ☁️ Google Gemini <span class="tiny">best quality · needs a free key</span></label>
+          <label><input type="radio" name="engine" value="local"> 📱 On-device <span class="tiny">no key · works offline · rougher drafts</span></label>
+        </div>
+        <div id="cloud-engine-box">
         <p class="hint">Transcription uses Google's Gemini API <strong>free tier</strong> (no credit card).
           <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Get a free key at Google AI Studio</a>
           and paste it below. The key is stored only in this browser.</p>
@@ -170,6 +179,12 @@
           <input type="text" id="model-name" value="gemini-3.8-flash">
         </label>
         <p class="tiny">If transcription ever fails with a "model not found" error, check AI Studio for the current model name and update this field.</p>
+        </div>
+        <div id="local-engine-box" hidden>
+          <p class="hint">The on-device model (~400&nbsp;MB) downloads once, then runs entirely in this browser — no key, no quota, works offline. It needs WebGPU: Chrome or Edge on a computer is best, and most iPads can't run it. It's much rougher at reading handwriting than Gemini, so expect to lean on the correction loop.</p>
+          <button id="local-model-btn" class="btn" type="button">Download on-device model</button>
+          <p id="local-model-status" class="tiny"></p>
+        </div>
       </details>
 
       <button id="transcribe-btn" class="btn primary big" type="button" disabled>Transcribe →</button>
@@ -295,8 +310,9 @@ setTimeout(() => {
 
 /* ---------------- 1. Config & prompts ---------------- */
 // This is the entire "recognition layer": image in, MusicXML out.
-// To swap providers later, rewrite callGemini() and keep its contract:
-//   callGemini(promptText, { includeImage:boolean }) -> Promise<string>
+// callGemini() is the dispatcher — it routes to the Gemini cloud API or to
+// LocalEngine (section 5b) based on state.engine, keeping one contract:
+//   callGemini(promptText, includeImage, onRetry?) -> Promise<string>
 // Everything downstream only ever sees MusicXML text.
 const DEFAULT_MODEL = "gemini-3.8-flash";
 const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -350,6 +366,7 @@ Return the FULL corrected MusicXML document in ONE \`\`\`xml code fence (output 
 const state = {
   pages: [],            // [{ dataUrl, b64 }] — one per photographed page, in order
   imageB64: null,       // the page photo currently being sent to the API
+  engine: "cloud",      // "cloud" (Gemini) or "local" (on-device model)
   isDemo: false,
   musicXml: null,
   notes: [],            // "Uncertain:" lines from the model
@@ -497,6 +514,48 @@ function getModel() { return ($("model-name").value.trim() || DEFAULT_MODEL); }
 function saveSetting(k, v) { try { localStorage.setItem(k, v); } catch (_) { /* ignore */ } }
 $("api-key").addEventListener("input", () => saveSetting("ss_key", $("api-key").value));
 
+// Transcription engine picker (cloud Gemini vs. on-device model).
+function refreshEngineUI() {
+  const local = state.engine === "local";
+  $("cloud-engine-box").hidden = local;
+  $("local-engine-box").hidden = !local;
+  if (local) {
+    const btn = $("local-model-btn");
+    const status = $("local-model-status");
+    if (LocalEngine._model) {
+      status.textContent = "✓ On-device model ready.";
+      btn.disabled = true;
+    } else if (!LocalEngine.supported()) {
+      status.textContent = "⚠️ This browser can't run the on-device model (WebGPU isn't available). Chrome or Edge on a computer works best — or switch back to Gemini above.";
+      btn.disabled = true;
+    } else {
+      status.textContent = "";
+      btn.disabled = false;
+    }
+  }
+}
+document.querySelectorAll('input[name="engine"]').forEach((r) => r.addEventListener("change", () => {
+  state.engine = document.querySelector('input[name="engine"]:checked').value;
+  saveSetting("ss_engine", state.engine);
+  refreshEngineUI();
+}));
+$("local-model-btn").addEventListener("click", async () => {
+  const btn = $("local-model-btn");
+  const status = $("local-model-status");
+  btn.disabled = true;
+  try {
+    await LocalEngine.ensure((p) => {
+      if (p && p.status === "progress") status.textContent = `Downloading… ${Math.round(p.progress || 0)}%${p.file ? " (" + p.file + ")" : ""}`;
+      else status.textContent = "Downloading…";
+    });
+    status.textContent = "✓ On-device model ready — it stays downloaded in this browser.";
+  } catch (err) {
+    status.textContent = "";
+    btn.disabled = false;
+    toast("Couldn't load the on-device model: " + err.message, 7000);
+  }
+});
+
 // "What's an API key?" info modal.
 const keyModal = $("key-info-modal");
 $("key-info-btn").addEventListener("click", () => { keyModal.hidden = false; });
@@ -507,9 +566,11 @@ $("model-name").addEventListener("input", () => saveSetting("ss_model", $("model
 
 /* ---------------- 5. Transcription API ---------------- */
 // Contract: callGemini(promptText, includeImage, onRetry?) -> Promise<string>.
-// Retries rate-limit (429), overloaded (503), and network errors with
-// exponential backoff; other failures throw immediately.
+// Dispatches to the cloud or on-device engine (section 5b) per state.engine.
+// Cloud branch retries rate-limit (429), overloaded (503), and network errors
+// with exponential backoff; other failures throw immediately.
 async function callGemini(promptText, includeImage, onRetry) {
+  if (state.engine === "local") return LocalEngine.complete(promptText, includeImage);
   const key = getKey();
   if (!key) throw new Error("Add your free Gemini API key under Settings first (or try the demo).");
   const url = `${GEMINI_ENDPOINT}/${encodeURIComponent(getModel())}:generateContent?key=${encodeURIComponent(key)}`;
@@ -552,6 +613,91 @@ async function callGemini(promptText, includeImage, onRetry) {
   }
   throw lastErr;
 }
+
+/* ---------------- 5b. On-device engine (transformers.js + WebGPU) ---------------- */
+// Offline alternative to the cloud API: SmolVLM-500M (quantized) runs entirely
+// in the browser. No key, no quota, works offline after a one-time ~400 MB
+// download. Needs WebGPU (Chrome/Edge on a computer); most iPads can't run it.
+// Same contract as callGemini: complete(promptText, includeImage) -> Promise<string>.
+// Rougher than Gemini on handwriting — the correction loop does heavier lifting.
+const LOCAL_MODEL_ID = "HuggingFaceTB/SmolVLM-500M-Instruct";
+const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm";
+const LOCAL_MAX_TOKENS = 8192;   // a 5-part 8-bar score is ~5k tokens of MusicXML
+const LOCAL_IMAGE_MAX = 1536;    // longest photo side in px: detail vs. speed
+
+const LocalEngine = {
+  _lib: null, _processor: null, _model: null, _loadPromise: null,
+
+  supported() {
+    return typeof navigator !== "undefined" && "gpu" in navigator;
+  },
+
+  // importer is injectable for tests: (url) => Promise<module>
+  async ensure(progressCb, importer) {
+    if (this._model) return;
+    if (!this.supported()) {
+      throw new Error("This browser can't run the on-device model (WebGPU isn't available). Use Chrome or Edge on a computer, or switch back to Gemini in Settings.");
+    }
+    if (!this._loadPromise) {
+      this._loadPromise = (async () => {
+        const tf = await (importer || ((u) => import(u)))(TRANSFORMERS_CDN);
+        const forward = (p) => { try { progressCb && progressCb(p); } catch (_) {} };
+        this._processor = await tf.AutoProcessor.from_pretrained(LOCAL_MODEL_ID, { progress_callback: forward });
+        this._model = await tf.AutoModelForVision2Seq.from_pretrained(LOCAL_MODEL_ID, {
+          device: "webgpu", dtype: "q4f16", progress_callback: forward,
+        });
+        this._lib = tf;
+      })().catch((err) => { this._loadPromise = null; throw err; });
+    }
+    return this._loadPromise;
+  },
+
+  // state.imageB64 -> downscaled canvas (separate method so tests can stub it)
+  async _photoCanvas() {
+    const img = await new Promise((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error("Couldn't read the page photo."));
+      el.src = "data:image/jpeg;base64," + state.imageB64;
+    });
+    const scale = Math.min(1, LOCAL_IMAGE_MAX / Math.max(img.naturalWidth, img.naturalHeight));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+    canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+    return canvas;
+  },
+
+  async complete(promptText, includeImage) {
+    await this.ensure((p) => {
+      if (p && p.status === "progress") showProgress(`Downloading on-device model (one-time)… ${Math.round(p.progress || 0)}%`);
+      else showProgress("Downloading on-device model (one-time)…");
+    });
+    showProgress("Reading with the on-device model… (this can take a few minutes)");
+    const tf = this._lib;
+    const content = [];
+    let images = [];
+    if (includeImage) {
+      if (!state.imageB64) throw new Error("No photo loaded.");
+      images = [await tf.RawImage.fromCanvas(await this._photoCanvas())];
+      content.push({ type: "image" });
+    }
+    // Small models follow instructions loosely: keep the framing short and
+    // direct, then reuse the exact transcription contract downstream expects.
+    content.push({ type: "text", text: "You are a music transcription tool. Follow the instructions exactly. Output only what is asked.\n\n" + promptText });
+    const messages = [{ role: "user", content }];
+    const chatText = this._processor.apply_chat_template(messages, { add_generation_prompt: true });
+    const inputs = await this._processor(chatText, images);
+    const output = await this._model.generate({ ...inputs, max_new_tokens: LOCAL_MAX_TOKENS, do_sample: false });
+    const promptLen = inputs.input_ids.dims[1];
+    const decoded = this._processor.batch_decode(output.slice(null, [promptLen, null]), { skip_special_tokens: true });
+    const text = (decoded[0] || "").trim();
+    if (!text) throw new Error("The on-device model returned nothing. Try again.");
+    return text;
+  },
+
+  reset() { this._lib = this._processor = this._model = null; this._loadPromise = null; },
+};
 
 // Pull the ```xml fence out of the model's reply; the rest is the
 // "Uncertain:" notes list. Throws if nothing looks like MusicXML.
@@ -731,6 +877,10 @@ document.addEventListener("DOMContentLoaded", () => {
     const savedModel = localStorage.getItem("ss_model");
     $("model-name").value = (!savedModel || savedModel === "gemini-2.5-flash")
       ? DEFAULT_MODEL : savedModel;
+    const savedEngine = localStorage.getItem("ss_engine");
+    if (savedEngine === "local" || savedEngine === "cloud") state.engine = savedEngine;
+    document.querySelectorAll('input[name="engine"]').forEach((r) => { r.checked = (r.value === state.engine); });
+    refreshEngineUI();
   } catch (_) { /* ignore */ }
   loadVerovio(0);
 });
@@ -783,7 +933,7 @@ function showReview() {
 
 $("transcribe-btn").addEventListener("click", async () => {
   if (!state.pages.length) { toast("Add at least one page photo first."); return; }
-  if (!getKey()) { toast("Add your free Gemini API key under Settings first (or try the demo)."); return; }
+  if (state.engine === "cloud" && !getKey()) { toast("Add your free Gemini API key under Settings first (or try the demo)."); return; }
   showWorking();
   try {
     const n = state.pages.length;
@@ -842,7 +992,7 @@ function renderOriginalPhotos() {
 $("apply-correction").addEventListener("click", async () => {
   const text = $("correction-input").value.trim();
   if (!text) { toast("Describe the mistake first."); return; }
-  if (!getKey()) {
+  if (state.engine === "cloud" && !getKey()) {
     toast("Add your free Gemini API key under Settings to use corrections.");
     return;
   }
