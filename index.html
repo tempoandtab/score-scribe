@@ -179,6 +179,12 @@
           <input type="text" id="model-name" value="gemini-3.8-flash">
         </label>
         <p class="tiny">If transcription ever fails with a "model not found" error, check AI Studio for the current model name and update this field.</p>
+        <div class="key-label"><label for="or-key">Backup key <span class="tiny">(optional)</span></label></div>
+        <input type="password" id="or-key" placeholder="sk-or-v1…" autocomplete="off">
+        <label>Backup model name
+          <input type="text" id="or-model" value="google/gemma-4-26b-a4b-it:free">
+        </label>
+        <p class="tiny">Optional backup: a free <a href="https://openrouter.ai/keys" target="_blank" rel="noopener">OpenRouter key</a> (free account, no credit card). When Gemini's daily free limit runs out, the app automatically retries with the backup. Free models change often — if the backup stops working, pick a current free vision model at <a href="https://openrouter.ai/models" target="_blank" rel="noopener">openrouter.ai/models</a> (filter by :free) and paste its name above.</p>
         </div>
         <div id="local-engine-box" hidden>
           <p class="hint">The on-device model (~400&nbsp;MB) downloads once, then runs entirely in this browser — no key, no quota, works offline. It needs WebGPU: Chrome or Edge on a computer is best, and most iPads can't run it. It's much rougher at reading handwriting than Gemini, so expect to lean on the correction loop.</p>
@@ -316,6 +322,8 @@ setTimeout(() => {
 // Everything downstream only ever sees MusicXML text.
 const DEFAULT_MODEL = "gemini-3.8-flash";
 const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models";
+const DEFAULT_OR_MODEL = "google/gemma-4-26b-a4b-it:free"; // OpenRouter free vision model (they rotate; editable in Settings)
+const OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
 
 const TRANSCRIBE_PROMPT = `You are a precise music transcription engine. The attached image is a photograph of a HANDWRITTEN full musical score: multiple staves, one staff per instrument (for example a string orchestra score with Violin I, Violin II, Viola, Cello, Double Bass — but the actual instrumentation may differ; read any handwritten instrument labels).
 
@@ -564,15 +572,40 @@ keyModal.addEventListener("click", (e) => { if (e.target === keyModal) keyModal.
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") keyModal.hidden = true; });
 $("model-name").addEventListener("input", () => saveSetting("ss_model", $("model-name").value));
 
+// Optional backup engine: OpenRouter (free tier) used automatically when
+// Gemini's daily free quota is exhausted.
+function getOrKey()   { return $("or-key").value.trim(); }
+function getOrModel() { return ($("or-model").value.trim() || DEFAULT_OR_MODEL); }
+$("or-key").addEventListener("input", () => saveSetting("ss_orkey", $("or-key").value));
+$("or-model").addEventListener("input", () => saveSetting("ss_ormodel", $("or-model").value));
+
 /* ---------------- 5. Transcription API ---------------- */
 // Contract: callGemini(promptText, includeImage, onRetry?) -> Promise<string>.
-// Dispatches to the cloud or on-device engine (section 5b) per state.engine.
-// Cloud branch retries rate-limit (429), overloaded (503), and network errors
-// with exponential backoff; other failures throw immediately.
+// Dispatches per state.engine: on-device (5b) or the cloud chain — Gemini
+// primary (5, callGeminiApi), OpenRouter backup (5c, callOpenRouter) when
+// Gemini's free daily quota runs out. Cloud 503s/network errors retry with
+// exponential backoff; 429s throw immediately as quotaExhausted.
 async function callGemini(promptText, includeImage, onRetry) {
   if (state.engine === "local") return LocalEngine.complete(promptText, includeImage);
+  // Cloud chain: Gemini primary, OpenRouter backup when Gemini's free quota runs out.
+  if (getKey()) {
+    try {
+      return await callGeminiApi(promptText, includeImage, onRetry);
+    } catch (err) {
+      if (!err.quotaExhausted || !getOrKey()) throw err;
+      if (onRetry) { try { onRetry("backup"); } catch (_) {} }
+      return callOpenRouter(promptText, includeImage);
+    }
+  }
+  if (getOrKey()) return callOpenRouter(promptText, includeImage);
+  throw new Error("Add your free Gemini API key under Settings first (or try the demo).");
+}
+
+// Gemini cloud API. 503s (servers busy) retry with backoff; 429 means the free
+// daily quota is out — those throw immediately as quotaExhausted so retries
+// don't burn the ~20/day budget, and the dispatcher fails over to the backup.
+async function callGeminiApi(promptText, includeImage, onRetry) {
   const key = getKey();
-  if (!key) throw new Error("Add your free Gemini API key under Settings first (or try the demo).");
   const url = `${GEMINI_ENDPOINT}/${encodeURIComponent(getModel())}:generateContent?key=${encodeURIComponent(key)}`;
   const parts = [{ text: promptText }];
   if (includeImage) {
@@ -596,7 +629,8 @@ async function callGemini(promptText, includeImage, onRetry) {
       if (!res.ok) {
         const msg = (data.error && data.error.message) || `Request failed (HTTP ${res.status})`;
         const err = new Error(msg);
-        err.retryable = (res.status === 429 || res.status === 503);
+        err.retryable = (res.status === 503);
+        err.quotaExhausted = (res.status === 429);
         throw err;
       }
       const text = (data.candidates?.[0]?.content?.parts || [])
@@ -605,6 +639,11 @@ async function callGemini(promptText, includeImage, onRetry) {
       return text;
     } catch (err) {
       lastErr = err;
+      if (err.quotaExhausted) {
+        err.message = "Gemini's free daily limit is out (resets 3 AM ET)." +
+          (getOrKey() ? "" : " Add a backup OpenRouter key in Settings for automatic failover.");
+        throw err;
+      }
       const retryable = err.retryable || err instanceof TypeError; // TypeError = network failure
       if (!retryable || attempt === MAX_ATTEMPTS) throw err;
       if (onRetry) { try { onRetry(attempt); } catch (_) {} }
@@ -612,6 +651,50 @@ async function callGemini(promptText, includeImage, onRetry) {
     }
   }
   throw lastErr;
+}
+
+// Backup cloud engine: OpenRouter free-tier vision model (OpenAI-compatible).
+// Single attempt — it's already the fallback, so no retry loops that could
+// ping-pong between providers.
+async function callOpenRouter(promptText, includeImage) {
+  const key = getOrKey();
+  if (!key) throw new Error("Add a backup OpenRouter key in Settings to use the backup engine.");
+  const content = [{ type: "text", text: promptText }];
+  if (includeImage) {
+    if (!state.imageB64) throw new Error("No photo loaded.");
+    content.push({ type: "image_url", image_url: { url: "data:image/jpeg;base64," + state.imageB64 } });
+  }
+  let res;
+  try {
+    res = await fetch(OPENROUTER_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + key,
+        "HTTP-Referer": "https://scorescribe.tempoandtab.com",
+        "X-Title": "ScoreScribe",
+      },
+      body: JSON.stringify({
+        model: getOrModel(),
+        messages: [{ role: "user", content }],
+        temperature: 0.15,
+        max_tokens: 16384,
+      }),
+    });
+  } catch (err) {
+    throw new Error("Backup engine unreachable: " + err.message);
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = (data.error && data.error.message) || `Backup request failed (HTTP ${res.status})`;
+    if (res.status === 429 || res.status === 402) {
+      throw new Error("The backup engine's free limit is out too — both free quotas reset overnight (Gemini at 3 AM ET).");
+    }
+    throw new Error("Backup engine error: " + msg);
+  }
+  const text = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "";
+  if (!text.trim()) throw new Error("The backup engine returned an empty response. Try again.");
+  return text;
 }
 
 /* ---------------- 5b. On-device engine (transformers.js + WebGPU) ---------------- */
@@ -877,6 +960,9 @@ document.addEventListener("DOMContentLoaded", () => {
     const savedModel = localStorage.getItem("ss_model");
     $("model-name").value = (!savedModel || savedModel === "gemini-2.5-flash")
       ? DEFAULT_MODEL : savedModel;
+    const savedOrModel = localStorage.getItem("ss_ormodel");
+    $("or-model").value = savedOrModel || DEFAULT_OR_MODEL;
+    $("or-key").value = localStorage.getItem("ss_orkey") || "";
     const savedEngine = localStorage.getItem("ss_engine");
     if (savedEngine === "local" || savedEngine === "cloud") state.engine = savedEngine;
     document.querySelectorAll('input[name="engine"]').forEach((r) => { r.checked = (r.value === state.engine); });
@@ -933,12 +1019,14 @@ function showReview() {
 
 $("transcribe-btn").addEventListener("click", async () => {
   if (!state.pages.length) { toast("Add at least one page photo first."); return; }
-  if (state.engine === "cloud" && !getKey()) { toast("Add your free Gemini API key under Settings first (or try the demo)."); return; }
+  if (state.engine === "cloud" && !getKey() && !getOrKey()) { toast("Add a transcription key under Settings first — Gemini, or OpenRouter as backup (or try the demo)."); return; }
   showWorking();
   try {
     const n = state.pages.length;
     const busyMsg = (attempt) => {
-      $("progress-text").textContent = `Google's servers are busy — retrying (attempt ${attempt + 1} of 4)…`;
+      $("progress-text").textContent = attempt === "backup"
+        ? "Gemini's daily free limit is out — trying the backup engine…"
+        : `Google's servers are busy — retrying (attempt ${attempt + 1} of 4)…`;
     };
     const xmls = [];
     const notes = [];
@@ -992,8 +1080,8 @@ function renderOriginalPhotos() {
 $("apply-correction").addEventListener("click", async () => {
   const text = $("correction-input").value.trim();
   if (!text) { toast("Describe the mistake first."); return; }
-  if (state.engine === "cloud" && !getKey()) {
-    toast("Add your free Gemini API key under Settings to use corrections.");
+  if (state.engine === "cloud" && !getKey() && !getOrKey()) {
+    toast("Add a transcription key under Settings to use corrections.");
     return;
   }
   const btn = $("apply-correction");
@@ -1009,7 +1097,9 @@ $("apply-correction").addEventListener("click", async () => {
     const raw = await callGemini(
       correctionPrompt(text, state.musicXml, withPhoto, state.pages.length),
       withPhoto,
-      (attempt) => { $("progress-text").textContent = `Google's servers are busy — retrying (attempt ${attempt + 1} of 4)…`; }
+      (attempt) => { $("progress-text").textContent = attempt === "backup"
+        ? "Gemini's daily free limit is out — trying the backup engine…"
+        : `Google's servers are busy — retrying (attempt ${attempt + 1} of 4)…`; }
     );
     const { xml, notes } = parseTranscription(raw);
     state.musicXml = xml;
