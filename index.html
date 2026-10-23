@@ -184,7 +184,7 @@
         <label>Backup model name
           <input type="text" id="or-model" value="google/gemma-4-26b-a4b-it:free">
         </label>
-        <p class="tiny">Optional backup: a free <a href="https://openrouter.ai/keys" target="_blank" rel="noopener">OpenRouter key</a> (free account, no credit card). When Gemini's daily free limit runs out, the app automatically retries with the backup. Free models change often — if the backup stops working, pick a current free vision model at <a href="https://openrouter.ai/models" target="_blank" rel="noopener">openrouter.ai/models</a> (filter by :free) and paste its name above.</p>
+        <p class="tiny">Optional backup: a free <a href="https://openrouter.ai/keys" target="_blank" rel="noopener">OpenRouter key</a> (free account, no credit card). When Gemini's daily free limit runs out — or its servers stay busy — the app automatically switches to the backup. Free models change often — if the backup stops working, pick a current free vision model at <a href="https://openrouter.ai/models" target="_blank" rel="noopener">openrouter.ai/models</a> (filter by :free) and paste its name above.</p>
         </div>
         <div id="local-engine-box" hidden>
           <p class="hint">The on-device model (~400&nbsp;MB) downloads once, then runs entirely in this browser — no key, no quota, works offline. It needs WebGPU: Chrome or Edge on a computer is best, and most iPads can't run it. It's much rougher at reading handwriting than Gemini, so expect to lean on the correction loop.</p>
@@ -599,17 +599,19 @@ $("or-model").addEventListener("input", () => saveSetting("ss_ormodel", $("or-mo
 // Contract: callGemini(promptText, includeImage, onRetry?) -> Promise<string>.
 // Dispatches per state.engine: on-device (5b) or the cloud chain — Gemini
 // primary (5, callGeminiApi), OpenRouter backup (5c, callOpenRouter) when
-// Gemini's free daily quota runs out. Cloud 503s/network errors retry with
-// exponential backoff; 429s throw immediately as quotaExhausted.
+// Gemini's free daily quota runs out or its servers stay busy. Cloud 503s
+// retry with exponential backoff first; 429s throw immediately as
+// quotaExhausted, exhausted 503s as serversBusy — both fail over.
 async function callGemini(promptText, includeImage, onRetry) {
   if (state.engine === "local") return LocalEngine.complete(promptText, includeImage);
-  // Cloud chain: Gemini primary, OpenRouter backup when Gemini's free quota runs out.
+  // Cloud chain: Gemini primary, OpenRouter backup on quota-out or busy.
   if (getKey()) {
     try {
       return await callGeminiApi(promptText, includeImage, onRetry);
     } catch (err) {
-      if (!err.quotaExhausted || !getOrKey()) throw err;
-      if (onRetry) { try { onRetry("backup"); } catch (_) {} }
+      const failover = err.quotaExhausted || err.serversBusy;
+      if (!failover || !getOrKey()) throw err;
+      if (onRetry) { try { onRetry(err.quotaExhausted ? "backup" : "backup-busy"); } catch (_) {} }
       return callOpenRouter(promptText, includeImage);
     }
   }
@@ -619,7 +621,9 @@ async function callGemini(promptText, includeImage, onRetry) {
 
 // Gemini cloud API. 503s (servers busy) retry with backoff; 429 means the free
 // daily quota is out — those throw immediately as quotaExhausted so retries
-// don't burn the ~20/day budget, and the dispatcher fails over to the backup.
+// don't burn the ~20/day budget. If every retry still gets a 503, the error
+// is flagged serversBusy instead. The dispatcher fails over to the backup
+// engine for both quotaExhausted and serversBusy.
 async function callGeminiApi(promptText, includeImage, onRetry) {
   const key = getKey();
   const url = `${GEMINI_ENDPOINT}/${encodeURIComponent(getModel())}:generateContent?key=${encodeURIComponent(key)}`;
@@ -661,7 +665,17 @@ async function callGeminiApi(promptText, includeImage, onRetry) {
         throw err;
       }
       const retryable = err.retryable || err instanceof TypeError; // TypeError = network failure
-      if (!retryable || attempt === MAX_ATTEMPTS) throw err;
+      if (!retryable || attempt === MAX_ATTEMPTS) {
+        if (err.retryable) {
+          // A 503 on every attempt means Google is overloaded, not just
+          // slow. Flag it so the dispatcher can fail over to the backup
+          // engine, and say so in plain language.
+          err.serversBusy = true;
+          err.message = "Google's servers stayed busy through 4 tries — this is on Google's end and usually clears within a few minutes." +
+            (getOrKey() ? "" : " A backup OpenRouter key in Settings would let the app switch to the backup engine automatically when this happens.");
+        }
+        throw err;
+      }
       if (onRetry) { try { onRetry(attempt); } catch (_) {} }
       await new Promise((r) => setTimeout(r, 1500 * 2 ** (attempt - 1)));
     }
@@ -1180,6 +1194,10 @@ async function transcribePage(i, n, busyMsg) {
     }
     return { xml: mergePageXml(rowXmls), notes };
   } catch (err) {
+    // Provider-level failures (quota out, servers busy) won't be fixed by
+    // re-reading the page whole — surface them right away instead of
+    // silently starting a second doomed attempt.
+    if (err.quotaExhausted || err.serversBusy) throw err;
     console.warn(`Row-by-row reading failed on page ${i + 1}; reading the page whole instead.`, err);
     const whole = await readWhole();
     whole.notes.unshift(pageTag + "read this page whole — row-by-row didn't work here");
@@ -1196,6 +1214,8 @@ $("transcribe-btn").addEventListener("click", async () => {
     const busyMsg = (attempt) => {
       $("progress-text").textContent = attempt === "backup"
         ? "Gemini's daily free limit is out — trying the backup engine…"
+        : attempt === "backup-busy"
+        ? "Google's servers are busy — switching to the backup engine…"
         : `Google's servers are busy — retrying (attempt ${attempt + 1} of 4)…`;
     };
     const xmls = [];
@@ -1265,6 +1285,8 @@ $("apply-correction").addEventListener("click", async () => {
       withPhoto,
       (attempt) => { $("progress-text").textContent = attempt === "backup"
         ? "Gemini's daily free limit is out — trying the backup engine…"
+        : attempt === "backup-busy"
+        ? "Google's servers are busy — switching to the backup engine…"
         : `Google's servers are busy — retrying (attempt ${attempt + 1} of 4)…`; }
     );
     const { xml, notes } = parseTranscription(raw);
