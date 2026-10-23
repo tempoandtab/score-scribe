@@ -191,6 +191,8 @@
           <button id="local-model-btn" class="btn" type="button">Download on-device model</button>
           <p id="local-model-status" class="tiny"></p>
         </div>
+        <label style="margin-top:14px"><input type="checkbox" id="row-mode" checked style="width:auto;margin:0 6px 0 0">Read row by row <span class="tiny">(recommended)</span></label>
+        <p class="tiny">Splits each page photo into its rows of music and reads them one at a time, then stitches them back together — small slices read much more accurately than one dense page. It uses one request per row, so the free daily limit runs out sooner.</p>
       </details>
 
       <button id="transcribe-btn" class="btn primary big" type="button" disabled>Transcribe →</button>
@@ -351,6 +353,15 @@ function pagePrompt(i, n) {
     `\n\nThis image is page ${i + 1} of ${n} of the same handwritten score. Transcribe ONLY the measures visible on this page, numbered from 1 within this page. Every page has the same instruments in the same top-to-bottom order — use identical part names on every page.`;
 }
 
+// Row mode: the image is one horizontal slice (one system, or one row of
+// staves) cropped out of a page. The appended paragraph narrows the page
+// prompt above to just this slice.
+function rowPrompt(pageI, pageN, rowI, rowN) {
+  const pageBit = pageN > 1 ? ` of page ${pageI + 1} of ${pageN}` : "";
+  return TRANSCRIBE_PROMPT +
+    `\n\nIMPORTANT — this image is a cropped slice: row ${rowI + 1} of ${rowN}${pageBit} of the same handwritten score. Transcribe ONLY the music visible in this slice, in reading order, numbering measures from 1 within this slice. Every staff visible in the slice is one part — use the same part names, in the same top-to-bottom order, as the rest of the score. The slice may begin mid-piece: a clef and key signature appear at its start, but a time signature may NOT be shown (it was stated in an earlier row) — if no time signature is visible, transcribe the measures anyway and do not invent one. The rows are stitched together afterwards, so do not add anything from outside this slice.`;
+}
+
 function correctionPrompt(userText, currentXml, hasImage, pageCount) {
   const source = hasImage
     ? "You previously transcribed the attached photograph of a handwritten full score into MusicXML."
@@ -375,6 +386,7 @@ const state = {
   pages: [],            // [{ dataUrl, b64 }] — one per photographed page, in order
   imageB64: null,       // the page photo currently being sent to the API
   engine: "cloud",      // "cloud" (Gemini) or "local" (on-device model)
+  rowMode: true,        // read each page row-by-row (systems) instead of whole
   isDemo: false,
   musicXml: null,
   notes: [],            // "Uncertain:" lines from the model
@@ -547,6 +559,10 @@ document.querySelectorAll('input[name="engine"]').forEach((r) => r.addEventListe
   saveSetting("ss_engine", state.engine);
   refreshEngineUI();
 }));
+$("row-mode").addEventListener("change", () => {
+  state.rowMode = $("row-mode").checked;
+  saveSetting("ss_rowmode", state.rowMode ? "1" : "0");
+});
 $("local-model-btn").addEventListener("click", async () => {
   const btn = $("local-model-btn");
   const status = $("local-model-status");
@@ -863,6 +879,120 @@ function mergePageXml(xmlStrings) {
   return XML_PROLOG + new XMLSerializer().serializeToString(merged);
 }
 
+/* ---------------- 5c. Row-by-row reading ---------------- */
+// Small slices read far more reliably than a whole dense page — the same
+// trick StaffPad uses (it reads one bar at a time). In row mode each page
+// photo is sliced into its horizontal rows of music (systems), each row is
+// transcribed separately, and the rows are stitched with mergePageXml().
+
+// Pure helper: given the ink coverage of every horizontal pixel row of a
+// photo (0 = blank paper .. 1 = fully dark), find the music systems as
+// vertical bands. Returns [[y0, y1], ...] as fractions of the image
+// height, top to bottom; [[0, 1]] when no reliable split exists.
+function bandsFromProfile(profile) {
+  const H = profile.length;
+  if (!H) return [[0, 1]];
+  // Smooth (box blur, radius ~0.4% of height) so speckle noise in a photo
+  // doesn't look like ink.
+  const rad = Math.max(1, Math.round(H * 0.004));
+  const prefix = new Array(H + 1).fill(0);
+  for (let y = 0; y < H; y++) prefix[y + 1] = prefix[y] + profile[y];
+  const sm = new Array(H);
+  const ink = new Array(H);
+  for (let y = 0; y < H; y++) {
+    const a = Math.max(0, y - rad), b = Math.min(H - 1, y + rad);
+    sm[y] = (prefix[b + 1] - prefix[a]) / (b - a + 1);
+    ink[y] = sm[y] > 0.008;
+  }
+  // Runs of ink rows; merge runs split by gaps too small to separate two
+  // systems (the gap between the two staves of one system, say).
+  const minGap = Math.max(4, Math.round(H * 0.012));
+  const runs = [];
+  let start = -1;
+  for (let y = 0; y < H; y++) {
+    if (ink[y] && start < 0) start = y;
+    if (!ink[y] && start >= 0) { runs.push([start, y - 1]); start = -1; }
+  }
+  if (start >= 0) runs.push([start, H - 1]);
+  const merged = [];
+  for (const run of runs) {
+    const last = merged[merged.length - 1];
+    if (last && run[0] - last[1] - 1 < minGap) last[1] = run[1];
+    else merged.push([...run]);
+  }
+  // Drop slivers (a handwritten title line, a stray mark): a real system
+  // is taller than ~3% of the page and carries far more ink than a title.
+  const minBand = Math.max(6, Math.round(H * 0.032));
+  const masses = merged.map(([a, b]) => {
+    let m = 0;
+    for (let y = a; y <= b; y++) m += sm[y];
+    return m;
+  });
+  const sortedMass = [...masses].sort((x, y) => x - y);
+  const medianMass = sortedMass.length ? sortedMass[Math.floor(sortedMass.length / 2)] : 0;
+  const bands = merged.filter(([a, b], idx) =>
+    b - a + 1 >= minBand && masses[idx] >= 0.18 * medianMass);
+  if (bands.length < 2) return [[0, 1]];
+  // Pad each band a little so noteheads and ledger lines near an edge
+  // aren't clipped, and return fractions of the image height.
+  const pad = Math.round(H * 0.007);
+  return bands.map(([a, b]) => [
+    Math.max(0, a - pad) / H,
+    Math.min(H, b + 1 + pad) / H,
+  ]);
+}
+
+// Load an image source into an <img> element (used for slicing photos).
+function loadImgSource(src) {
+  return new Promise((res, rej) => {
+    const img = new Image();
+    img.onload = () => res(img);
+    img.onerror = rej;
+    img.src = src;
+  });
+}
+
+// Find the rows of music on one photographed page by scanning for
+// horizontal bands of ink. Returns [{ y0, y1 }] in pixels.
+async function detectSystems(page) {
+  const img = await loadImgSource(page.dataUrl);
+  const W = img.naturalWidth, H = img.naturalHeight;
+  const canvas = document.createElement("canvas");
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0);
+  const data = ctx.getImageData(0, 0, W, H).data;
+  const profile = new Array(H).fill(0);
+  for (let y = 0; y < H; y++) {
+    let dark = 0, tot = 0;
+    const rowOff = y * W * 4;
+    for (let x = 0; x < W; x += 2) {
+      const o = rowOff + x * 4;
+      const lum = 0.2126 * data[o] + 0.7152 * data[o + 1] + 0.0722 * data[o + 2];
+      if (lum < 150) dark++;
+      tot++;
+    }
+    profile[y] = tot ? dark / tot : 0;
+  }
+  return bandsFromProfile(profile).map(([a, b]) => ({
+    y0: Math.floor(a * H),
+    y1: Math.min(H, Math.ceil(b * H)),
+  }));
+}
+
+// Crop one detected row out of a page photo; returns base64 JPEG.
+async function cropPageBand(page, band) {
+  const img = await loadImgSource(page.dataUrl);
+  const canvas = document.createElement("canvas");
+  canvas.width = img.naturalWidth;
+  canvas.height = Math.max(1, band.y1 - band.y0);
+  canvas.getContext("2d").drawImage(
+    img, 0, band.y0, img.naturalWidth, canvas.height,
+    0, 0, canvas.width, canvas.height
+  );
+  return canvas.toDataURL("image/jpeg", 0.9).split(",")[1];
+}
+
 /* ---------------- 6. Engraving (Verovio) ---------------- */
 // Two CDNs for the engine: the official build, then the npm package via
 // jsDelivr as a fallback. Loading is dynamic so failures are visible and
@@ -966,6 +1096,8 @@ document.addEventListener("DOMContentLoaded", () => {
     const savedEngine = localStorage.getItem("ss_engine");
     if (savedEngine === "local" || savedEngine === "cloud") state.engine = savedEngine;
     document.querySelectorAll('input[name="engine"]').forEach((r) => { r.checked = (r.value === state.engine); });
+    state.rowMode = localStorage.getItem("ss_rowmode") !== "0";
+    $("row-mode").checked = state.rowMode;
     refreshEngineUI();
   } catch (_) { /* ignore */ }
   loadVerovio(0);
@@ -1017,6 +1149,44 @@ function showReview() {
   $("pill-4").classList.add("done"); // export is part of the review screen
 }
 
+// Transcribe one photographed page. In row mode (Settings, on by
+// default) the page is sliced into its rows of music and each row is read
+// separately, then the rows are stitched with mergePageXml(). Any failure
+// in row mode falls back to reading the page whole.
+async function transcribePage(i, n, busyMsg) {
+  const page = state.pages[i];
+  const pageTag = n > 1 ? `p.${i + 1}: ` : "";
+  const readWhole = async () => {
+    showProgress(n > 1 ? `Reading page ${i + 1} of ${n}…` : "Reading your handwriting…");
+    state.imageB64 = page.b64; // the active photo for this request
+    const parsed = parseTranscription(await callGemini(pagePrompt(i, n), true, busyMsg));
+    return { xml: parsed.xml, notes: parsed.notes.map((t) => pageTag + t) };
+  };
+  if (!state.rowMode) return readWhole();
+  let bands = null;
+  try { bands = await detectSystems(page); } catch (_) { bands = null; }
+  if (!bands || bands.length < 2) return readWhole();
+  try {
+    const rowXmls = [];
+    const notes = [];
+    for (let r = 0; r < bands.length; r++) {
+      showProgress(n > 1
+        ? `Reading page ${i + 1} of ${n} — row ${r + 1} of ${bands.length}…`
+        : `Reading row ${r + 1} of ${bands.length}…`);
+      state.imageB64 = await cropPageBand(page, bands[r]); // the active photo for this request
+      const parsed = parseTranscription(await callGemini(rowPrompt(i, n, r, bands.length), true, busyMsg));
+      rowXmls.push(parsed.xml);
+      parsed.notes.forEach((t) => notes.push(`${pageTag}row ${r + 1}: ${t}`));
+    }
+    return { xml: mergePageXml(rowXmls), notes };
+  } catch (err) {
+    console.warn(`Row-by-row reading failed on page ${i + 1}; reading the page whole instead.`, err);
+    const whole = await readWhole();
+    whole.notes.unshift(pageTag + "read this page whole — row-by-row didn't work here");
+    return whole;
+  }
+}
+
 $("transcribe-btn").addEventListener("click", async () => {
   if (!state.pages.length) { toast("Add at least one page photo first."); return; }
   if (state.engine === "cloud" && !getKey() && !getOrKey()) { toast("Add a transcription key under Settings first — Gemini, or OpenRouter as backup (or try the demo)."); return; }
@@ -1031,13 +1201,9 @@ $("transcribe-btn").addEventListener("click", async () => {
     const xmls = [];
     const notes = [];
     for (let i = 0; i < n; i++) {
-      showProgress(n > 1 ? `Reading page ${i + 1} of ${n}…` : "Reading your handwriting…");
-      state.imageB64 = state.pages[i].b64; // the active photo for this request
-      const raw = await callGemini(pagePrompt(i, n), true, busyMsg);
-      const parsed = parseTranscription(raw);
-      xmls.push(parsed.xml);
-      const prefix = n > 1 ? `p.${i + 1}: ` : "";
-      parsed.notes.forEach((nt) => notes.push(prefix + nt));
+      const res = await transcribePage(i, n, busyMsg);
+      xmls.push(res.xml);
+      notes.push(...res.notes);
     }
     state.musicXml = mergePageXml(xmls);
     state.notes = notes;
